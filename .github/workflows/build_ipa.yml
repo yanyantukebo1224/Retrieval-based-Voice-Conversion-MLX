@@ -10,11 +10,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || true
+
+      # mlx-swift とその内部サブモジュールを直接クローン
+      - name: Setup Submodules
+        run: |
+          cd Demos/iOS/RVCNative/Vendor
+          rm -rf mlx-swift
+          git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
 
       - name: Build iOS App
         run: |
