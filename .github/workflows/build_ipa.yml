@@ -14,16 +14,18 @@ jobs:
       - name: Select Xcode 16
         run: sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer
 
-      # Swift Tools Version を 6.0 に調整してバージョンエラーを回避
-      - name: Fix Swift Tools Version
+      # RVCNativePackage の swift-tools-version を 6.0 に統一
+      - name: Fix RVCNativePackage Swift Tools Version
         run: |
           sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Demos/iOS/RVCNative/RVCNativePackage/Package.swift
 
-      - name: Setup Submodules
+      # mlx-swift をクローンし、その Package.swift の swift-tools-version も 6.0 に統一
+      - name: Setup Submodules & Fix mlx-swift Version
         run: |
           cd Demos/iOS/RVCNative/Vendor
           rm -rf mlx-swift
           git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
+          sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' mlx-swift/Package.swift
 
       - name: Build iOS App
         run: |
