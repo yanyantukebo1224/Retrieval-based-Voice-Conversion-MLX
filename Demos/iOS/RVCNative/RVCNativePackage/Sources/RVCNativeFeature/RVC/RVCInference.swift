@@ -101,16 +101,21 @@ import MLXNN
             }
             
             let hubertWeights = try MLX.loadArrays(url: actualHubertURL)
+            log("RVCInference: Raw HuBERT file keys count: \(hubertWeights.count), sample keys: \(Array(hubertWeights.keys.prefix(10)))")
+
             self.hubertModel = HubertModel(config: HubertConfig())
             var newParams: [String: MLXArray] = [:]
             for (k, v) in hubertWeights {
                 var newKey = k
                 var val = v
-                // Strip "model." or "hubert." prefix if present in HF / PyTorch / RVC safetensors
-                if newKey.hasPrefix("model.") {
-                    newKey = String(newKey.dropFirst(6))
-                } else if newKey.hasPrefix("hubert.") {
-                    newKey = String(newKey.dropFirst(7))
+                
+                // Repeatedly strip "model." or "hubert." prefix
+                while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
+                    if newKey.hasPrefix("model.") {
+                        newKey = String(newKey.dropFirst(6))
+                    } else if newKey.hasPrefix("hubert.") {
+                        newKey = String(newKey.dropFirst(7))
+                    }
                 }
 
                 // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
