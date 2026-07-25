@@ -54,14 +54,42 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Fix RVCNativePackage Swift Tools Version
+        run: |
+          if [ -f "Demos/iOS/RVCNative/RVCNativePackage/Package.swift" ]; then
+            sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Demos/iOS/RVCNative/RVCNativePackage/Package.swift
+          fi
+
+      - name: Setup Submodules & Checkout Stable mlx-swift
+        run: |
+          cd Demos/iOS/RVCNative/Vendor
+          if [ ! -d "mlx-swift" ]; then
+            git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
+          fi
+          cd mlx-swift
+          git checkout v0.18.0 || git checkout v0.16.0 || true
+          git submodule update --init --recursive
+          if [ -f "Package.swift" ]; then
+            sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Package.swift
+          fi
+
+      - name: Resolve Package Dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -workspace Demos/iOS/RVCNative/RVCNative.xcworkspace \
+            -scheme RVCNative
 
       - name: Build iOS Project (Simulator)
         run: |
           xcodebuild build \
-            -project Demos/iOS/RVCNative/RVCNative.xcodeproj \
+            -workspace Demos/iOS/RVCNative/RVCNative.xcworkspace \
             -scheme RVCNative \
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
