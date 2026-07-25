@@ -71,6 +71,13 @@ public class RVCInference: ObservableObject {
     }
 
     public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
+        // 🚨【安全ガード】rmvpe や hubert がメインボイスモデル (modelURL) に渡された場合は即座に弾く
+        let modelName = modelURL.lastPathComponent.lowercased()
+        if modelName.contains("rmvpe") || modelName.contains("hubert") {
+            log("RVCInference: ⚠️ [GUARD] Invalid modelURL (\(modelURL.lastPathComponent)). RMVPE/HuBERT cannot be loaded as Synthesizer!")
+            return
+        }
+
         DispatchQueue.main.async { self.status = "Loading models..." }
         
         // 1. Load Hubert
@@ -165,7 +172,7 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
         }
         
-        // 2. Load Synthesizer
+        // 2. Load Synthesizer (Main Voice Model)
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
         let modelWeights = try MLX.loadArrays(url: modelURL)
 
@@ -297,13 +304,11 @@ public class RVCInference: ObservableObject {
                     newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
 
                     var val = v
-                    // RMVPE 2D/1D Conv2d 重み次元修正
                     if newKey.hasSuffix(".weight") {
                         if val.ndim == 3 {
-                            // 3次元配列 [Out, In, K] を MLX Conv2d 用 4次元配列 [Out, K, 1, In] に拡張
                             val = val.expandedDimensions(axis: 2)
-                        } else if val.ndim == 4 {
-                            // PyTorch Conv2D [Out, In, H, W] -> MLX Conv2D [Out, H, W, In]
+                        }
+                        if val.ndim == 4 {
                             val = val.transposed(axes: [0, 2, 3, 1])
                         }
                     }
