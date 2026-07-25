@@ -165,13 +165,9 @@ public final class PthConverter: Sendable {
         }
         
         // 5. Reconstruct Tensors
-        // 5. Reconstruct Tensors
-        let storageBase = storageRoot // Directory containing 'data.pkl' (or 'data' parent)
-                                                             // Usually storage files are in a 'data' subdir relative to this
-        
+        let storageBase = storageRoot
         var mlxDict: [String: MLXArray] = [:]
         
-        // Count tensors for progress
         let totalItems = stateDict.count
         var currentItem = 0
         
@@ -184,15 +180,14 @@ public final class PthConverter: Sendable {
                 }
             }
             
-            // Update progress every few items to avoid overhead
             currentItem += 1
             if currentItem % 5 == 0 {
-                let p = 0.2 + (0.7 * Double(currentItem) / Double(totalItems)) // Scale 20% -> 90%
+                let p = 0.2 + (0.7 * Double(currentItem) / Double(totalItems))
                 progress?(p, "Loading tensors (\(Int(p * 100))%)...")
             }
         }
         
-        // 6. Apply Model Conversion Logic (Weight Norm & Transpose)
+        // 6. Apply Model Conversion Logic (Weight Norm & Key Remapping)
         progress?(0.9, "Optimizing weights...")
         mlxDict = try processWeights(mlxDict)
         
@@ -201,12 +196,6 @@ public final class PthConverter: Sendable {
     }
     
     private func loadTensor(ref: TensorReference, baseDir: URL) throws -> MLXArray {
-        // Filename is usually just the key "0", "1", etc.
-        // It resides in 'data/' subdirectory relative to data.pkl usually.
-        // But the pickle PersistentID path might vary.
-        // Usually PyTorch saves as 'data/0', 'data/1'...
-        
-        // Use ref.storage.filename ("0", "1"...)
         let filename = ref.storage.filename
         let storageUrl = baseDir.appendingPathComponent("data").appendingPathComponent(filename)
         
@@ -216,19 +205,11 @@ public final class PthConverter: Sendable {
         
         let rawData = try Data(contentsOf: storageUrl)
         
-        // Convert Data to MLXArray
-        // Assume Float32 mostly for standard models. Dtype logic needed for 16-bit.
-        
         if ref.storage.dtype.contains("FloatStorage") {
             let floats = rawData.withUnsafeBytes {
                 Array($0.bindMemory(to: Float.self))
             }
-            // Create array
             var array = MLXArray(floats)
-            
-            // Reshape
-            // If strides are standard (contiguous), we can just reshape.
-            // PyTorch default is row-major contiguous.
             if !ref.size.isEmpty {
                  array = array.reshaped(ref.size)
             }
@@ -249,7 +230,7 @@ public final class PthConverter: Sendable {
              return array
         }
         
-        return MLXArray(0) // Fallback
+        return MLXArray(0)
     }
     
     private func processWeights(_ dict: [String: MLXArray]) throws -> [String: MLXArray] {
@@ -260,7 +241,7 @@ public final class PthConverter: Sendable {
         // Weight Norm Fusion
         for k in keys {
             if k.hasSuffix(".weight_g") {
-                let prefix = String(k.dropLast(9)) // remove .weight_g
+                let prefix = String(k.dropLast(9))
                 if processedPrefixes.contains(prefix) { continue }
                 
                 guard let w_g = dict[k],
@@ -268,20 +249,8 @@ public final class PthConverter: Sendable {
                     continue
                 }
                 
-                // Norm calculation
-                // PyTorch: norm_v = np.linalg.norm(w_v, axis=(1, 2) if w_v.ndim == 3 else 1)
-                // MLX: example w_v shape [Out, In, Kernel] (dim 3) or [Out, In] (dim 2)
-                
-                // Norm calculation
-                // PyTorch: norm_v = np.linalg.norm(w_v, axis=(1, 2) if w_v.ndim == 3 else 1)
-                
-                // Norm calculation
-                // PyTorch: norm_v = np.linalg.norm(w_v, axis=(1, 2) if w_v.ndim == 3 else 1)
-                
                 var norm_v: MLXArray
                 if w_v.ndim == 3 {
-                    // Manual L2 norm: sqrt(sum(x^2))
-                    // MLX Swift uses 'axes' for multiple axes
                     norm_v = MLX.sqrt(MLX.sum(w_v * w_v, axes: [1, 2], keepDims: true))
                 } else {
                     norm_v = MLX.sqrt(MLX.sum(w_v * w_v, axes: [1], keepDims: true))
@@ -292,20 +261,17 @@ public final class PthConverter: Sendable {
                 processedPrefixes.insert(prefix)
                 
             } else if k.hasSuffix(".weight_v") {
-                // Skip, handled above
+                // Skip
             } else {
                 newDict[k] = dict[k]
             }
         }
         
-        // Key remapping: Convert PyTorch naming to Swift model structure
-        // flow.flows.0 -> flow.flow_0, flow.flows.2 -> flow.flow_1, etc.
-        // in_layers.0 -> in_layer_0, res_skip_layers.0 -> res_skip_layer_0, etc.
+        // Key remapping
         var remappedDict: [String: MLXArray] = [:]
         for (k, v) in newDict {
             var newKey = k
 
-            // Remap flow indices: flows.0 -> flow_0, flows.2 -> flow_1, flows.4 -> flow_2, flows.6 -> flow_3
             if newKey.contains("flow.flows.") {
                 newKey = newKey.replacingOccurrences(of: "flow.flows.0", with: "flow.flow_0")
                 newKey = newKey.replacingOccurrences(of: "flow.flows.2", with: "flow.flow_1")
@@ -313,17 +279,14 @@ public final class PthConverter: Sendable {
                 newKey = newKey.replacingOccurrences(of: "flow.flows.6", with: "flow.flow_3")
             }
 
-            // Remap layer list indices: in_layers.0 -> in_layer_0, res_skip_layers.0 -> res_skip_layer_0
             let layerPattern = try? NSRegularExpression(pattern: "(in_layers|res_skip_layers)\\.(\\d+)")
             if let regex = layerPattern {
                 let range = NSRange(newKey.startIndex..., in: newKey)
                 newKey = regex.stringByReplacingMatches(in: newKey, range: range, withTemplate: "$1_$2")
-                // Fix: in_layers_0 should be in_layer_0 (singular)
                 newKey = newKey.replacingOccurrences(of: "in_layers_", with: "in_layer_")
                 newKey = newKey.replacingOccurrences(of: "res_skip_layers_", with: "res_skip_layer_")
             }
 
-            // Remap decoder keys: noise_convs.N -> noise_conv_N, ups.N -> up_N
             if let noisePattern = try? NSRegularExpression(pattern: "dec\\.noise_convs\\.(\\d+)") {
                 let range = NSRange(newKey.startIndex..., in: newKey)
                 newKey = noisePattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "dec.noise_conv_$1")
@@ -334,8 +297,6 @@ public final class PthConverter: Sendable {
                 newKey = upsPattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "dec.up_$1")
             }
 
-            // Remap resblocks: dec.resblocks.N.convs1.M -> dec.resblock_N.c1_M
-            //                  dec.resblocks.N.convs2.M -> dec.resblock_N.c2_M
             if let resblock1Pattern = try? NSRegularExpression(pattern: "dec\\.resblocks\\.(\\d+)\\.convs1\\.(\\d+)") {
                 let range = NSRange(newKey.startIndex..., in: newKey)
                 newKey = resblock1Pattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "dec.resblock_$1.c1_$2")
@@ -346,10 +307,6 @@ public final class PthConverter: Sendable {
                 newKey = resblock2Pattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "dec.resblock_$1.c2_$2")
             }
 
-            // Remap encoder attention/ffn layers: enc_p.encoder.attn_layers.N -> enc_p.encoder.attn_N
-            //                                     enc_p.encoder.norm_layers_1.N -> enc_p.encoder.norm1_N
-            //                                     enc_p.encoder.norm_layers_2.N -> enc_p.encoder.norm2_N
-            //                                     enc_p.encoder.ffn_layers.N -> enc_p.encoder.ffn_N
             if let attnPattern = try? NSRegularExpression(pattern: "enc_p\\.encoder\\.attn_layers\\.(\\d+)") {
                 let range = NSRange(newKey.startIndex..., in: newKey)
                 newKey = attnPattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "enc_p.encoder.attn_$1")
@@ -370,8 +327,6 @@ public final class PthConverter: Sendable {
                 newKey = ffnPattern.stringByReplacingMatches(in: newKey, range: range, withTemplate: "enc_p.encoder.ffn_$1")
             }
 
-            // Remap LayerNorm parameters: gamma -> weight, beta -> bias
-            // PyTorch LayerNorm uses gamma/beta, MLX uses weight/bias
             if newKey.hasSuffix(".gamma") {
                 newKey = String(newKey.dropLast(6)) + ".weight"
             } else if newKey.hasSuffix(".beta") {
@@ -381,30 +336,11 @@ public final class PthConverter: Sendable {
             remappedDict[newKey] = v
         }
 
-        // Transposition for MLX Conv1d/Linear
-        // PyTorch Conv1d weights: [Out, In, Kernel]
-        // MLX Conv1d weights: [Out, Kernel, In]
-        // ConvTranspose (ups/up_) weights use [1, 2, 0]: (In, Out, Kernel) -> (Out, Kernel, In)
-        // Regular Conv weights use [0, 2, 1]: (Out, In, Kernel) -> (Out, Kernel, In)
-
-        var finalDict: [String: MLXArray] = [:]
-        for (k, v) in remappedDict {
-            var val = v
-            if k.contains("emb") && k.contains("weight") {
-                // Embedding weights - no transposition needed
-            } else if k.contains("weight") && val.ndim == 3 {
-                // Check for upsample (ConvTranspose) layers - after remapping, keys are "dec.up_N"
-                if k.contains(".up_") || k.contains(".ups.") {
-                    val = val.transposed(axes: [1, 2, 0])
-                } else {
-                    val = val.transposed(axes: [0, 2, 1])
-                }
-            } else if k.contains("weight") && val.ndim == 2 && k.lowercased().contains("linear") {
-                val = val.transposed() // (Out, In) -> (In, Out) - Required for MLX Linear
-            }
-            finalDict[k] = val
-        }
+        // ⚠️【修正ポイント】
+        // 無差別な 3次元重みの転置処理（val.transposed）を削除し、
+        // PyTorchの元のデータ構造を壊さずに返形します。
+        // RVC / RMVPE / HuBERT の個別の転置処理は RVCInference.swift で行われます。
         
-        return finalDict
+        return remappedDict
     }
 }
