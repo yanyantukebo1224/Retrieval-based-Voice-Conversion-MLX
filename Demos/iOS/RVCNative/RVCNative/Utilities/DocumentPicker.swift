@@ -2,15 +2,17 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// UIKit document picker wrapped for SwiftUI usage with security scope & Japanese filename handling.
+/// UIKit document picker wrapped for SwiftUI usage with asCopy: true, security scope & Japanese filename handling.
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
     let onPick: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes)
+        // asCopy: true を明示指定し、ファイルをタップした際に即座に確定・受取可能にする
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
         picker.delegate = context.coordinator
         picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
         return picker
     }
 
@@ -53,6 +55,10 @@ struct DocumentPicker: UIViewControllerRepresentable {
                 print("Failed to copy picked file to temp directory: \(error)")
                 onPick(url)
             }
+        }
+        
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            print("Document picker was cancelled.")
         }
     }
 }

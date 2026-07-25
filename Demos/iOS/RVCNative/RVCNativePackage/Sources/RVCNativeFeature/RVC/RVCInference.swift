@@ -699,16 +699,21 @@ import MLXNN
             guard let hubertModel = hubertModel else {
                 throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "Hubert model missing"])
             }
-            let hubertFeatures = hubertModel(audioInput) // [1, Frames, 768]
-            MLX.eval(hubertFeatures)
+            var hubertFeatures: MLXArray!
+            autoreleasepool {
+                hubertFeatures = hubertModel(audioInput) // [1, Frames, 768]
+                MLX.eval(hubertFeatures)
+            }
             GPU.clearCache()  // MEMORY FIX: Clear after HuBERT
             log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
             
             // DEBUG: Log first HuBERT frame's first 5 features
-            let hubertSlice = hubertFeatures[0, 0, 0..<5].asType(Float.self)
-            MLX.eval(hubertSlice)
-            let hubertSamples = hubertSlice.asArray(Float.self)
-            log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
+            autoreleasepool {
+                let hubertSlice = hubertFeatures[0, 0, 0..<5].asType(Float.self)
+                MLX.eval(hubertSlice)
+                let hubertSamples = hubertSlice.asArray(Float.self)
+                log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
+            }
 
 
             // 2. F0 Estimation (16kHz -> 100fps)

@@ -177,10 +177,12 @@ public final class PthConverter: Sendable {
         var currentItem = 0
         
         for (key, value) in stateDict {
-            if let tensorRef = value as? TensorReference {
-                // print("PTH Layer: \(key), Size: \(tensorRef.size), Storage: \(tensorRef.storage.dtype)")
-                let array = try loadTensor(ref: tensorRef, baseDir: storageBase)
-                mlxDict[key] = array
+            autoreleasepool {
+                if let tensorRef = value as? TensorReference {
+                    if let array = try? loadTensor(ref: tensorRef, baseDir: storageBase) {
+                        mlxDict[key] = array
+                    }
+                }
             }
             
             // Update progress every few items to avoid overhead
