@@ -87,8 +87,20 @@ import MLXNN
             
             // 1. Load Hubert
             log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
-            let hubertWeights = try MLX.loadArrays(url: hubertURL)
+            var actualHubertURL = hubertURL
+            let hExt = hubertURL.pathExtension.lowercased()
+            if hExt == "pt" || hExt == "pth" {
+                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let dest = docs.appendingPathComponent("hubert_base.safetensors")
+                if FileManager.default.fileExists(atPath: dest.path) {
+                    actualHubertURL = dest
+                } else if let arrays = try? PthConverter.shared.convert(url: hubertURL) {
+                    try? MLX.save(arrays: arrays, url: dest)
+                    actualHubertURL = dest
+                }
+            }
             
+            let hubertWeights = try MLX.loadArrays(url: actualHubertURL)
             self.hubertModel = HubertModel(config: HubertConfig())
             var newParams: [String: MLXArray] = [:]
             for (k, v) in hubertWeights {

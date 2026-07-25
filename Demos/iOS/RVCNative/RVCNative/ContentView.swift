@@ -738,11 +738,11 @@ struct ContentView: View {
         }
         log("Found model at \(url.path)")
 
-        // マルチパス検索で HuBERT を確実に発見
-        let hubertUrl = findSystemModelURL(name: "hubert_base", extensions: ["safetensors", "npz", "pt", "pth"])
-            ?? findSystemModelURL(name: "hubert", extensions: ["safetensors", "npz", "pt", "pth"])
+        // マルチパス検索で HuBERT を確実に発見 (safetensors, npz を最優先)
+        let foundHubert = findSystemModelURL(name: "hubert_base", extensions: ["safetensors", "npz", "pth", "pt"])
+            ?? findSystemModelURL(name: "hubert", extensions: ["safetensors", "npz", "pth", "pt"])
 
-        guard let hubertURL = hubertUrl else {
+        guard let rawHubertURL = foundHubert else {
             log("Failed to find hubert_base.safetensors in Documents or Bundle")
             statusMessage = "HuBERT model missing! Please import hubert_base.safetensors"
             alertTitle = "Model Missing"
@@ -750,11 +750,53 @@ struct ContentView: View {
             showAlert = true
             return
         }
+
+        // もし .pt / .pth 形式であれば事前に .safetensors に変換してそのパスを使用
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let hubertURL: URL
+        let ext = rawHubertURL.pathExtension.lowercased()
+        if ext == "pt" || ext == "pth" {
+            let dest = docs.appendingPathComponent("hubert_base.safetensors")
+            if FileManager.default.fileExists(atPath: dest.path) {
+                hubertURL = dest
+            } else if let arrays = try? PthConverter.shared.convert(url: rawHubertURL) {
+                try? MLX.save(arrays: arrays, url: dest)
+                try? FileManager.default.removeItem(at: rawHubertURL)
+                hubertURL = dest
+                log("Auto-converted HuBERT from .pt/.pth to .safetensors")
+            } else {
+                hubertURL = rawHubertURL
+            }
+        } else {
+            hubertURL = rawHubertURL
+        }
         log("Found HuBERT model at \(hubertURL.path)")
 
-        // マルチパス検索で RMVPE を自動検索
-        let rmvpeURL = findSystemModelURL(name: "rmvpe", extensions: ["safetensors", "npz", "pt", "pth"])
+        // マルチパス検索で RMVPE を自動検索 (safetensors, npz 最優先)
+        let foundRMVPE = findSystemModelURL(name: "rmvpe", extensions: ["safetensors", "npz", "pth", "pt"])
             ?? findSystemModelURL(name: "rmvpe_mlx", extensions: ["safetensors", "npz"])
+        
+        let rmvpeURL: URL?
+        if let rawRMVPE = foundRMVPE {
+            let extR = rawRMVPE.pathExtension.lowercased()
+            if extR == "pt" || extR == "pth" {
+                let destR = docs.appendingPathComponent("rmvpe.safetensors")
+                if FileManager.default.fileExists(atPath: destR.path) {
+                    rmvpeURL = destR
+                } else if let arrays = try? PthConverter.shared.convert(url: rawRMVPE) {
+                    try? MLX.save(arrays: arrays, url: destR)
+                    try? FileManager.default.removeItem(at: rawRMVPE)
+                    rmvpeURL = destR
+                    log("Auto-converted RMVPE from .pt/.pth to .safetensors")
+                } else {
+                    rmvpeURL = rawRMVPE
+                }
+            } else {
+                rmvpeURL = rawRMVPE
+            }
+        } else {
+            rmvpeURL = nil
+        }
 
         // Search for matching index file (for imported models)
         var indexUrl: URL? = nil
