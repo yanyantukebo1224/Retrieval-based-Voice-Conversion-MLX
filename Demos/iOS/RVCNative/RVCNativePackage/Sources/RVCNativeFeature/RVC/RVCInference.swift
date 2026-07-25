@@ -297,9 +297,14 @@ public class RVCInference: ObservableObject {
                     newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
 
                     var val = v
-                    // 安全策: 万が一RMVPE側でConv2dに4次元が必要な場合のみ転置する
-                    if newKey.hasSuffix(".weight") && val.ndim == 4 {
-                        val = val.transposed(axes: [0, 2, 3, 1])
+                    // 【重要な修正】3次元の畳み込み重み（Conv2d用）を自動検出して4次元（Conv2dレイアウト）に自動安全変換する
+                    if newKey.hasSuffix(".weight") {
+                        if val.ndim == 4 {
+                            val = val.transposed(axes: [0, 2, 3, 1])
+                        } else if val.ndim == 3 && newKey.contains("unet.") {
+                            // PyTorch Conv2d [Out, In, K] -> MLX Conv2d [Out, K, 1, In]
+                            val = val.expandedDimensions(axis: 2).transposed(axes: [0, 1, 2, 3])
+                        }
                     }
                     remappedRMVPE[newKey] = val
                 }
