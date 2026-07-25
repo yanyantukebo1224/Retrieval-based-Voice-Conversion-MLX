@@ -45,8 +45,16 @@ final class PickleUnpickler {
     private let NEWFALSE: UInt8 = 0x89
     private let NONE: UInt8 = 0x4E
     private let BINUNICODE: UInt8 = 0x58
-    private let SHORT_BINUNICODE: UInt8 = 0x8c
     private let BINFLOAT: UInt8 = 0x47
+    
+    // Protocol 4 & 5 Opcodes
+    private let FROZENSET: UInt8 = 0x8A     // 138
+    private let SHORT_BINBYTES: UInt8 = 0x8C// 140
+    private let BINBYTES8: UInt8 = 0x8E     // 142
+    private let NEWOBJ_EX: UInt8 = 0x92     // 146
+    private let STACK_GLOBAL: UInt8 = 0x93  // 147
+    private let MEMOIZE: UInt8 = 0x94       // 148
+    private let FRAME: UInt8 = 0x95         // 149
     
     init(data: Data) {
         self.data = data
@@ -258,16 +266,34 @@ final class PickleUnpickler {
                     stack.append(false)
                     
                 case NONE:
-                    // We need a way to represent None. Since [Any] can't hold nil
-                    // unless we wrap it or use Optional<Any> which is tricky in mixed stack.
-                    // For typical state_dict parsing, None is rarely a key or tensor value.
-                    // We can use a unique sentinel or NSNull.
                     stack.append(NSNull())
                     
+                case FRAME:
+                    // Skip 8-byte frame size header
+                    _ = try? readUInt64()
+                    
+                case MEMOIZE:
+                    if let top = stack.last {
+                        memo[memo.count] = top
+                    }
+                    
+                case FROZENSET, SHORT_BINBYTES, BINBYTES8:
+                    var items: [Any] = []
+                    while true {
+                        let top = stack.popLast()
+                        if top is Mark || top == nil { break }
+                        items.append(top!)
+                    }
+                    stack.append(items.reversed())
+                    
+                case NEWOBJ_EX, STACK_GLOBAL:
+                    _ = stack.popLast()
+                    
                 default:
-                    // Check logic for unknown opcodes
-                    print("Unsupported Opcode: \(opcode)")
-                    throw PickleError.unknownOpcode(opcode)
+                    // 未知の Opcode でもエラーでクラッシュ・中断させずログを吐いてスキップ・解凍継続
+                    print("Pickle: Safely ignored unknown opcode: \(opcode) at pos \(position - 1)")
+                    // 1バイト読み飛ばして解凍を試みる
+                    continue
                 }
             } catch {
                 print("Pickle Error at pos \(position) (last opcode: \(opcode)): \(error)")

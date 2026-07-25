@@ -526,6 +526,13 @@ struct ContentView: View {
                         let dest = docs.appendingPathComponent(modelName + ".safetensors")
                         try MLX.save(arrays: arrays, url: dest)
 
+                        // 変換成功後に元ファイル (.pth, .pt, .zip) を自動削除（.index は絶対保護）
+                        let ext = destURL.pathExtension.lowercased()
+                        if ext == "pth" || ext == "pt" || ext == "zip" {
+                            try? FileManager.default.removeItem(at: destURL)
+                            log("Auto-deleted source archive after conversion: \(destURL.lastPathComponent)")
+                        }
+
                         await MainActor.run {
                             statusMessage = "Converted & Imported: \(modelName)"
                             log("Converted model saved to \(dest.path)")
@@ -611,7 +618,8 @@ struct ContentView: View {
                     if extLower == "pth" || extLower == "pt" {
                         if let arrays = try? PthConverter.shared.convert(url: file) {
                             try? MLX.save(arrays: arrays, url: dest)
-                            log("Auto-converted HuBERT model to \(dest.lastPathComponent)")
+                            try? FileManager.default.removeItem(at: file)
+                            log("Auto-converted HuBERT model to \(dest.lastPathComponent) and removed source \(file.lastPathComponent)")
                         }
                     } else if extLower == "safetensors" || extLower == "npz" {
                         try? FileManager.default.removeItem(at: dest)
@@ -622,18 +630,31 @@ struct ContentView: View {
             }
             
             // RMVPE モデルの自動識別
-            if nameLower.contains("rmvpe") && extLower != "log" {
+            else if nameLower.contains("rmvpe") && extLower != "log" {
                 let dest = docs.appendingPathComponent("rmvpe.safetensors")
                 if file != dest {
                     if extLower == "pth" || extLower == "pt" {
                         if let arrays = try? PthConverter.shared.convert(url: file) {
                             try? MLX.save(arrays: arrays, url: dest)
-                            log("Auto-converted RMVPE model to \(dest.lastPathComponent)")
+                            try? FileManager.default.removeItem(at: file)
+                            log("Auto-converted RMVPE model to \(dest.lastPathComponent) and removed source \(file.lastPathComponent)")
                         }
                     } else if extLower == "safetensors" || extLower == "npz" {
                         try? FileManager.default.removeItem(at: dest)
                         try? FileManager.default.copyItem(at: file, to: dest)
                         log("Auto-classified RMVPE model: \(file.lastPathComponent) -> \(dest.lastPathComponent)")
+                    }
+                }
+            }
+            
+            // 一般の RVC ボイスモデル (.pth / .pt / .zip) の自動変換と元ファイル削除 (.index は厳重保護)
+            else if (extLower == "pth" || extLower == "pt" || extLower == "zip") && !nameLower.hasPrefix(".") {
+                let modelName = file.deletingPathExtension().lastPathComponent
+                let dest = docs.appendingPathComponent("\(modelName).safetensors")
+                if let arrays = try? PthConverter.shared.convert(url: file, copyIndexTo: docs) {
+                    if (try? MLX.save(arrays: arrays, url: dest)) != nil {
+                        try? FileManager.default.removeItem(at: file)
+                        log("Auto-converted voice model: \(file.lastPathComponent) -> \(dest.lastPathComponent) and removed source file.")
                     }
                 }
             }
