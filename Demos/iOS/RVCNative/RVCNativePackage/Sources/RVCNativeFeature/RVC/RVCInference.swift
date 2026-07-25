@@ -523,8 +523,11 @@ public class RVCInference: ObservableObject {
             cleanAudio = cleanAudio.flattened()
         }
         
-        // 【修正】Conv1dが期待する形状 [Batch, Length, Channels] (Channels = 1) に厳密に整形する
-        let audioInput = cleanAudio.expandedDimensions(axis: 0).expandedDimensions(axis: 2)
+        // 【修正】MLXのConv1dが期待するチャンネルファースト形式 [Batch, Channels, Length] に整形する
+        var audioInput = cleanAudio.expandedDimensions(axis: 0).expandedDimensions(axis: 1)
+        if audioInput.ndim == 3 && audioInput.shape[2] == 1 {
+            audioInput = audioInput.transposed(axes: [0, 2, 1])
+        }
         
         guard let hubertModel = hubertModel else {
             throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
