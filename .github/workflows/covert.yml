@@ -1,0 +1,45 @@
+name: Convert Models to Safetensors
+
+on:
+  workflow_dispatch: # 手動実行ボタンを有効化
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install torch safetensors requests
+
+      - name: Download and Convert
+        run: |
+          python -c "
+          import torch, os
+          from safetensors.torch import save_file
+
+          def convert(url, out_name):
+              print(f'Downloading {url}...')
+              os.system(f'curl -L {url} -o temp.pt')
+              ckpt = torch.load('temp.pt', map_location='cpu')
+              sd = ckpt.get('model', ckpt.get('state_dict', ckpt))
+              clean_sd = {k: v.contiguous() for k, v in sd.items() if isinstance(v, torch.Tensor)}
+              save_file(clean_sd, out_name)
+              os.remove('temp.pt')
+              print(f'Done: {out_name}')
+
+          convert('https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt', 'hubert_base.safetensors')
+          convert('https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt', 'rmvpe.safetensors')
+          "
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: safetensors-models
+          path: |
+            hubert_base.safetensors
+            rmvpe.safetensors
