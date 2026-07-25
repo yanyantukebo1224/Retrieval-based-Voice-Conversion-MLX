@@ -1,4 +1,4 @@
-Import Foundation
+import Foundation
 import MLX
 import MLXRandom
 import MLXNN
