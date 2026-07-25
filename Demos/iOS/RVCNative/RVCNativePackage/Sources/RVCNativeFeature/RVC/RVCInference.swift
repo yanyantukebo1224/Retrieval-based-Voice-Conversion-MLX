@@ -97,7 +97,6 @@ public class RVCInference: ObservableObject {
             var newKey = k
             let val = v
             
-            // Repeatedly strip "model." or "hubert." prefix
             while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
                 if newKey.hasPrefix("model.") {
                     newKey = String(newKey.dropFirst(6))
@@ -106,7 +105,6 @@ public class RVCInference: ObservableObject {
                 }
             }
 
-            // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
             if newKey.hasPrefix("encoder.layers.") {
                 let parts = newKey.components(separatedBy: ".")
                 if parts.count >= 3, let idx = Int(parts[2]) {
@@ -114,7 +112,6 @@ public class RVCInference: ObservableObject {
                 }
             }
             
-            // Remap feature_extractor.conv_layers.X.Y to feature_extractor.lX.conv/layer_norm
             if newKey.hasPrefix("feature_extractor.conv_layers.") {
                 let parts = newKey.components(separatedBy: ".")
                 if parts.count >= 3, let idx = Int(parts[2]) {
@@ -136,7 +133,6 @@ public class RVCInference: ObservableObject {
             newParams[newKey] = val
         }
         
-        // Fix HuBERT PosConv Weight Norm
         let gKey = "encoder.pos_conv_embed.conv.weight_g"
         let vKey = "encoder.pos_conv_embed.conv.weight_v"
         let outKey = "encoder.pos_conv_embed.conv.weight"
@@ -156,32 +152,22 @@ public class RVCInference: ObservableObject {
              let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true)
              let v_norm = sqrt(v_sum + 1e-12)
              let weight_normalized = weight_v / v_norm
-             
              let weight_fused = weight_g * weight_normalized
              
              newParams[outKey] = weight_fused
              newParams.removeValue(forKey: gKey)
              newParams.removeValue(forKey: vKey)
-             log("RVCInference: Fused HuBERT PosConv weights (transposed, dim=2)")
         }
-        log("RVCInference: Loaded \(newParams.count) HuBERT weights")
-        log("RVCInference: HuBERT sample keys: \(Array(newParams.keys.prefix(5)))")
         
         do {
             self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
-            log("RVCInference: HuBERT parameters successfully updated.")
         } catch {
             log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
         }
         
-        // 2. Load Synthesizer (TextEncoder + Flow + Generator)
+        // 2. Load Synthesizer
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
         let modelWeights = try MLX.loadArrays(url: modelURL)
-
-        log("RVCInference: Loaded \(modelWeights.count) weights (already in MLX format)")
-
-        let decKeys = modelWeights.keys.filter { $0.hasPrefix("dec.") }.sorted()
-        log("RVCInference: Generator weight keys: \(decKeys.prefix(20))...")
 
         var detectedSR = self.modelSampleRate
         var detectedUpsRates = [10, 10, 2, 2]
@@ -189,57 +175,19 @@ public class RVCInference: ObservableObject {
 
         let configURL = modelURL.deletingPathExtension().appendingPathExtension("json")
         if FileManager.default.fileExists(atPath: configURL.path) {
-            log("RVCInference: Found config at \(configURL.lastPathComponent)")
             if let data = try? Data(contentsOf: configURL),
                let json = try? JSONSerialization.jsonObject(with: data) as? [Any] {
-                if json.count > 17, let sr = json[17] as? Int {
-                    detectedSR = sr
-                    log("RVCInference: Detected Sample Rate \(detectedSR)Hz")
-                }
+                if json.count > 17, let sr = json[17] as? Int { detectedSR = sr }
                 if json.count > 12, let uArr = json[12] as? [Any] {
                     let u = uArr.compactMap { $0 as? Int }
-                    if !u.isEmpty {
-                        detectedUpsRates = u
-                        log("RVCInference: Detected Upsample Rates \(detectedUpsRates)")
-                    }
+                    if !u.isEmpty { detectedUpsRates = u }
                 }
                 if json.count > 14, let kArr = json[14] as? [Any] {
                     let k = kArr.compactMap { $0 as? Int }
-                    if !k.isEmpty {
-                        detectedKernelSizes = k
-                        log("RVCInference: Detected Kernel Sizes \(detectedKernelSizes)")
-                    }
-                }
-            }
-        } else {
-            log("RVCInference: No config JSON found, detecting from weights...")
-        }
-
-        for i in 0..<4 {
-            let upKey = "dec.up_\(i).weight"
-            if let upWeight = modelWeights[upKey] {
-                let detectedK = upWeight.shape[1]
-                if detectedK != detectedKernelSizes[i] {
-                    log("RVCInference: ⚠️ Kernel mismatch for up_\(i): config=\(detectedKernelSizes[i]), weight=\(detectedK). Using weight value.")
-                    detectedKernelSizes[i] = detectedK
-
-                    if i < 2 {
-                        let inferredStride: Int
-                        switch detectedK {
-                        case 24: inferredStride = 12
-                        case 20: inferredStride = 10
-                        case 16: inferredStride = 10
-                        default: inferredStride = detectedUpsRates[i]
-                        }
-                        if inferredStride != detectedUpsRates[i] {
-                            log("RVCInference: ⚠️ Inferring stride for up_\(i) from kernel=\(detectedK): stride=\(inferredStride)")
-                            detectedUpsRates[i] = inferredStride
-                        }
-                    }
+                    if !k.isEmpty { detectedKernelSizes = k }
                 }
             }
         }
-        log("RVCInference: Final architecture - upsampleRates=\(detectedUpsRates), kernelSizes=\(detectedKernelSizes), sampleRate=\(detectedSR)")
 
         self.synthesizer = Synthesizer(
             interChannels: 192,
@@ -257,7 +205,6 @@ public class RVCInference: ObservableObject {
             upsampleKernelSizes: detectedKernelSizes,
             sampleRate: detectedSR
         )
-        
         self.modelSampleRate = detectedSR
         
         func needsConvInsertion(_ key: String) -> Bool {
@@ -272,12 +219,8 @@ public class RVCInference: ObservableObject {
             var newK = k
             let newV = v
 
-            if newK.contains("dec.ups.") {
-                newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_")
-            }
-            if newK.contains("dec.noise_convs.") {
-                newK = newK.replacingOccurrences(of: "dec.noise_convs.", with: "dec.noise_conv_")
-            }
+            if newK.contains("dec.ups.") { newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_") }
+            if newK.contains("dec.noise_convs.") { newK = newK.replacingOccurrences(of: "dec.noise_convs.", with: "dec.noise_conv_") }
             if newK.contains("dec.resblocks.") {
                 newK = newK.replacingOccurrences(of: "dec.resblocks.", with: "dec.resblock_")
                 newK = newK.replacingOccurrences(of: ".convs1.", with: ".c1_")
@@ -285,12 +228,8 @@ public class RVCInference: ObservableObject {
             }
 
             if newK.contains("dec.resblock_") && (newK.contains(".c1_") || newK.contains(".c2_")) {
-                let oldKey = newK
                 if newK.hasSuffix(".weight") && !newK.contains(".conv.") {
                     newK = newK.replacingOccurrences(of: ".weight", with: ".conv.weight")
-                    if oldKey.contains("c1_0") && oldKey.contains("resblock_0") {
-                        log("DEBUG: Remapped resblock key: \(oldKey) -> \(newK)")
-                    }
                 }
                 if newK.hasSuffix(".bias") && !newK.contains(".conv.") {
                     newK = newK.replacingOccurrences(of: ".bias", with: ".conv.bias")
@@ -307,69 +246,23 @@ public class RVCInference: ObservableObject {
             }
 
             if needsConvInsertion(newK) && !newK.contains(".conv.") {
-                if newK.hasSuffix(".weight") {
-                    newK = String(newK.dropLast(7)) + ".conv.weight"
-                } else if newK.hasSuffix(".bias") {
-                    newK = String(newK.dropLast(5)) + ".conv.bias"
-                }
+                if newK.hasSuffix(".weight") { newK = String(newK.dropLast(7)) + ".conv.weight" }
+                else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
             synthParams[newK] = newV
         }
 
-        for i in 0..<4 {
-            let gKey = "dec.up_\(i).weight_g"
-            let vKey = "dec.up_\(i).weight_v"
-            let outKey = "dec.up_\(i).weight"
-            
-            if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                let v_sqr = weight_v * weight_v
-                let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
-                let v_norm = sqrt(v_sum + 1e-12)
-                let weight_normalized = weight_v / v_norm
-                let weight_fused = weight_g * weight_normalized
-                
-                synthParams[outKey] = weight_fused
-                synthParams.removeValue(forKey: gKey)
-                synthParams.removeValue(forKey: vKey)
-            }
-        }
-        
-        for i in 0..<12 {
-            for (convPrefix, convCount) in [("c1_", 3), ("c2_", 3)] {
-                for j in 0..<convCount {
-                    let base = "dec.resblock_\(i).\(convPrefix)\(j)"
-                    let gKey = "\(base).weight_g"
-                    let vKey = "\(base).weight_v"
-                    let outKey = "\(base).conv.weight"
-                    
-                    if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                        let v_sqr = weight_v * weight_v
-                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
-                        let v_norm = sqrt(v_sum + 1e-12)
-                        let weight_normalized = weight_v / v_norm
-                        let weight_fused = weight_g * weight_normalized
-                        
-                        synthParams[outKey] = weight_fused
-                        synthParams.removeValue(forKey: gKey)
-                        synthParams.removeValue(forKey: vKey)
-                    }
-                }
-            }
-        }
-
         do {
-            self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
+            try self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
             self.synthesizer?.train(false)
-            log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
         } catch {
-            log("RVCInference: ⚠️ Error updating Synthesizer parameters: \(error)")
+            log("RVCInference: ⚠️ Error updating Synthesizer: \(error)")
         }
         
-        // 3. Load RMVPE (Optional)
+        // 3. Load RMVPE
         if let rmvpeURL = rmvpeURL {
             do {
-                log("RVCInference: Loading RMVPE from \(rmvpeURL.lastPathComponent)")
                 let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
                 self.rmvpe = RMVPE()
                 
@@ -404,32 +297,24 @@ public class RVCInference: ObservableObject {
                     newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
 
                     var val = v
+                    // 安全策: 万が一RMVPE側でConv2dに4次元が必要な場合のみ転置する
                     if newKey.hasSuffix(".weight") && val.ndim == 4 {
                         val = val.transposed(axes: [0, 2, 3, 1])
                     }
                     remappedRMVPE[newKey] = val
                 }
 
-                do {
-                    self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
-                } catch {
-                    log("RVCInference: ⚠️ Error updating RMVPE parameters: \(error)")
-                }
+                try self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
                 self.rmvpe?.setTrainingMode(false)
                 log("RVCInference: ✅ RMVPE loaded")
             } catch {
-                log("RVCInference: Failed to load RMVPE: \(error). Using fallback F0.")
+                log("RVCInference: Failed to load RMVPE: \(error)")
                 self.rmvpe = nil
             }
         }
 
-        // 4. Load CREPE (Optional)
         if let crepeURL = crepeURL {
-            do {
-                self.crepe = try CREPE(weightsURL: crepeURL, modelType: "full")
-            } catch {
-                self.crepe = nil
-            }
+            self.crepe = try? CREPE(weightsURL: crepeURL, modelType: "full")
         }
 
         self.hubertModel?.train(false)
@@ -446,12 +331,8 @@ public class RVCInference: ObservableObject {
     ) async {
         do {
             DispatchQueue.main.async { self.status = "Loading Audio..." }
-            
             let (audioArray, _) = try AudioProcessor.shared.loadAudio(url: audioURL)
             let totalSamples = audioArray.size
-            log("RVCInference: Processing \(totalSamples) samples")
-            
-            DispatchQueue.main.async { self.status = "Processing..." }
             
             let maxSamples = 16000 * 30
             var audioToProcess = audioArray
@@ -485,16 +366,12 @@ public class RVCInference: ObservableObject {
             }
             
             MLX.eval(finalOutput)
-
             if volumeEnvelope != 1.0 {
                 finalOutput = finalOutput * volumeEnvelope
                 MLX.eval(finalOutput)
             }
 
-            let outputSampleRate: Double = Double(self.modelSampleRate)
-            try AudioProcessor.shared.saveAudio(array: finalOutput, url: outputURL, sampleRate: outputSampleRate)
-            
-            log("RVCInference: Done!")
+            try AudioProcessor.shared.saveAudio(array: finalOutput, url: outputURL, sampleRate: Double(self.modelSampleRate))
             DispatchQueue.main.async { self.status = "Done!" }
             
         } catch {
@@ -510,16 +387,10 @@ public class RVCInference: ObservableObject {
         indexRate: Float
     ) async throws -> MLXArray {
         var cleanAudio = chunk
-        if cleanAudio.ndim == 2 {
-            cleanAudio = cleanAudio.mean(axis: 0)
-        }
-        if cleanAudio.ndim != 1 {
-            cleanAudio = cleanAudio.flattened()
-        }
+        if cleanAudio.ndim == 2 { cleanAudio = cleanAudio.mean(axis: 0) }
+        if cleanAudio.ndim != 1 { cleanAudio = cleanAudio.flattened() }
         
-        // 【アダプター修正】HubertFeatureExtractorの入力要件（expandedDimensions(axis: -1)）に一致させるため [Batch, Length, 1] に整形
-        var audioInput = cleanAudio.expandedDimensions(axis: 0) // [1, Length]
-        audioInput = audioInput.expandedDimensions(axis: -1)     // [1, Length, 1]
+        let audioInput = cleanAudio.expandedDimensions(axis: 0).expandedDimensions(axis: -1)
         
         guard let hubertModel = hubertModel else {
             throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
@@ -554,12 +425,8 @@ public class RVCInference: ObservableObject {
         let f0Len = f0.shape[1]
         let minLen = min(phoneLen, f0Len)
         
-        if phoneLen != minLen {
-            phone = phone[0..., 0..<minLen, 0...]
-        }
-        if f0Len != minLen {
-            f0 = f0[0..., 0..<minLen, 0...]
-        }
+        if phoneLen != minLen { phone = phone[0..., 0..<minLen, 0...] }
+        if f0Len != minLen { f0 = f0[0..., 0..<minLen, 0...] }
 
         if indexRate > 0, let indexManager = indexManager {
             phone = indexManager.search(features: phone, indexRate: indexRate)
