@@ -71,8 +71,8 @@ jobs:
           rm -rf mlx-swift
           git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
           cd mlx-swift
-          git fetch --tags
-          git checkout main || true
+          git checkout 0.18.0 || git checkout 0.16.0 || true
+          git submodule update --init --recursive
           if [ -f "Package.swift" ]; then
             sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Package.swift
           fi
