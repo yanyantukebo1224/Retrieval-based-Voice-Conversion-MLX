@@ -427,7 +427,7 @@ class Generator: Module {
             
             // MEMORY FIX: Evaluate and clear cache after each stage
             MLX.eval(out)
-            MLX.Memory.clearCache()
+            GPU.clearCache()
             print("DEBUG: Generator.ups[\(i)] (after resblocks) out: [\(out.min().item(Float.self))...\(out.max().item(Float.self))]")
         }
 

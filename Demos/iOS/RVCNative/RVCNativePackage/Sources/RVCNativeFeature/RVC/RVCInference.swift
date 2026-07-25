@@ -701,7 +701,7 @@ import MLXNN
             }
             let hubertFeatures = hubertModel(audioInput) // [1, Frames, 768]
             MLX.eval(hubertFeatures)
-            MLX.Memory.clearCache()  // MEMORY FIX: Clear after HuBERT
+            GPU.clearCache()  // MEMORY FIX: Clear after HuBERT
             log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
             
             // DEBUG: Log first HuBERT frame's first 5 features
@@ -787,7 +787,7 @@ import MLXNN
                 }
             }
             MLX.eval(f0)
-            MLX.Memory.clearCache()  // MEMORY FIX: Clear after F0 estimation
+            GPU.clearCache()  // MEMORY FIX: Clear after F0 estimation
             
             // 3. Upsample Hubert Features to match F0 (100fps)
             let N = hubertFeatures.shape[0]
