@@ -68,12 +68,11 @@ jobs:
       - name: Setup Submodules & Checkout Stable mlx-swift
         run: |
           cd Demos/iOS/RVCNative/Vendor
-          if [ ! -d "mlx-swift" ]; then
-            git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
-          fi
+          rm -rf mlx-swift
+          git clone --recursive https://github.com/ml-explore/mlx-swift.git mlx-swift
           cd mlx-swift
-          git checkout v0.18.0 || git checkout v0.16.0 || true
-          git submodule update --init --recursive
+          git fetch --tags
+          git checkout main || true
           if [ -f "Package.swift" ]; then
             sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Package.swift
           fi
