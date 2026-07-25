@@ -106,7 +106,11 @@ import MLXNN
             for (k, v) in hubertWeights {
                 var newKey = k
                 var val = v
-                
+                // Strip "model." prefix if present in HF / PyTorch safetensors
+                if newKey.hasPrefix("model.") {
+                    newKey = String(newKey.dropFirst(6))
+                }
+
                 // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
                 if newKey.hasPrefix("encoder.layers.") {
                     let parts = newKey.components(separatedBy: ".")
