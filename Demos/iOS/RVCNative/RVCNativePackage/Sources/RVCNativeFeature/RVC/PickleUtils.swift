@@ -150,10 +150,13 @@ final class PickleUnpickler {
                           let key = stack.popLast() else {
                         throw PickleError.invalidStructure
                     }
-                    guard let dict = stack.last as? NSMutableDictionary else {
-                         throw PickleError.invalidStructure
+                    if let dict = stack.last as? NSMutableDictionary {
+                        if let copyableKey = key as? NSCopying {
+                            dict.setObject(value, forKey: copyableKey)
+                        } else {
+                            dict[String(describing: key)] = value
+                        }
                     }
-                    dict[key] = value
                     
                 case APPENDS:
                     var items: [Any] = []
@@ -190,7 +193,11 @@ final class PickleUnpickler {
                         stack.append(dict!)
                     }
                     for (key, value) in items.reversed() {
-                        dict?[key] = value
+                        if let copyableKey = key as? NSCopying {
+                            dict?.setObject(value, forKey: copyableKey)
+                        } else {
+                            dict?[String(describing: key)] = value
+                        }
                     }
                     
                 case APPEND:
@@ -215,7 +222,11 @@ final class PickleUnpickler {
                             stack.append(global)
                         } else if let dict = stack.last as? NSMutableDictionary, let stateDict = state as? [String: Any] {
                             for (k, v) in stateDict {
-                                dict[k] = v
+                                if let copyableKey = k as? NSCopying {
+                                    dict.setObject(v, forKey: copyableKey)
+                                } else {
+                                    dict[k] = v
+                                }
                             }
                         }
                     }
@@ -232,7 +243,11 @@ final class PickleUnpickler {
                             let dict = NSMutableDictionary()
                             if let first = args.first as? [(Any, Any)] {
                                 for (k, v) in first {
-                                    dict[k] = v
+                                    if let ck = k as? NSCopying {
+                                        dict.setObject(v, forKey: ck)
+                                    } else {
+                                        dict[String(describing: k)] = v
+                                    }
                                 }
                             }
                             stack.append(dict)

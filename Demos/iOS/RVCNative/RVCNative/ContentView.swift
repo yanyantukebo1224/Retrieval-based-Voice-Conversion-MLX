@@ -673,16 +673,25 @@ struct ContentView: View {
         scanAndAutoClassifyDocuments()
         
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        guard let files = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
+        let modelsDir = docs.appendingPathComponent("models")
+        
+        var searchFiles: [URL] = []
+        if let filesInDocs = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) {
+            searchFiles.append(contentsOf: filesInDocs)
+        }
+        if let filesInModels = try? FileManager.default.contentsOfDirectory(at: modelsDir, includingPropertiesForKeys: nil) {
+            searchFiles.append(contentsOf: filesInModels)
+        }
 
         let systemModelNames = ["hubert", "hubert_base", "rmvpe", "rmvpe_mlx", "crepe", "crepe_tiny"]
-        importedModels = files
+        let names = searchFiles
             .filter { $0.pathExtension == "safetensors" || $0.pathExtension == "npz" }
             .map { $0.deletingPathExtension().lastPathComponent }
             .filter { name in
                 !name.hasPrefix(".") && !systemModelNames.contains(name.lowercased())
             }
-            .sorted()
+        
+        importedModels = Array(Set(names)).sorted()
     }
 
     func findSystemModelURL(name: String, extensions: [String]) -> URL? {
