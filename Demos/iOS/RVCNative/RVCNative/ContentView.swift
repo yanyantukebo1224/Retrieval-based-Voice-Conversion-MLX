@@ -610,6 +610,24 @@ struct ContentView: View {
         
         let hubertDest = docs.appendingPathComponent("hubert_base.safetensors")
         let rmvpeDest = docs.appendingPathComponent("rmvpe.safetensors")
+
+        // 空/壊れた hubert_base.safetensors の自動清掃
+        if fileManager.fileExists(atPath: hubertDest.path) {
+            if let attr = try? fileManager.attributesOfItem(atPath: hubertDest.path),
+               let size = attr[.size] as? UInt64, size < 1024 {
+                try? fileManager.removeItem(at: hubertDest)
+                log("Removed invalid/empty hubert_base.safetensors (size \(size) bytes)")
+            }
+        }
+
+        // 空/壊れた rmvpe.safetensors の自動清掃
+        if fileManager.fileExists(atPath: rmvpeDest.path) {
+            if let attr = try? fileManager.attributesOfItem(atPath: rmvpeDest.path),
+               let size = attr[.size] as? UInt64, size < 1024 {
+                try? fileManager.removeItem(at: rmvpeDest)
+                log("Removed invalid/empty rmvpe.safetensors (size \(size) bytes)")
+            }
+        }
         
         for file in files {
             let nameLower = file.deletingPathExtension().lastPathComponent.lowercased()
@@ -618,16 +636,9 @@ struct ContentView: View {
             // 1. HuBERT モデルの自働識別 & 完全保存保護
             if (nameLower.contains("hubert") || nameLower == "hubert_base") && extLower != "log" {
                 if !fileManager.fileExists(atPath: hubertDest.path) {
-                    if extLower == "safetensors" || extLower == "npz" {
+                    if (extLower == "safetensors" || extLower == "npz") && file != hubertDest {
                         try? fileManager.copyItem(at: file, to: hubertDest)
                         log("Auto-classified HuBERT model to Documents/hubert_base.safetensors")
-                    } else if extLower == "pth" || extLower == "pt" {
-                        if let arrays = try? PthConverter.shared.convert(url: file) {
-                            if (try? MLX.save(arrays: arrays, url: hubertDest)) != nil {
-                                try? fileManager.removeItem(at: file)
-                                log("Auto-converted HuBERT model to Documents/hubert_base.safetensors and removed source")
-                            }
-                        }
                     }
                 } else {
                     log("Documents/hubert_base.safetensors already exists and protected.")
@@ -637,34 +648,12 @@ struct ContentView: View {
             // 2. RMVPE モデルの自働識別 & 完全保存保護
             else if nameLower.contains("rmvpe") && extLower != "log" {
                 if !fileManager.fileExists(atPath: rmvpeDest.path) {
-                    if extLower == "safetensors" || extLower == "npz" {
+                    if (extLower == "safetensors" || extLower == "npz") && file != rmvpeDest {
                         try? fileManager.copyItem(at: file, to: rmvpeDest)
                         log("Auto-classified RMVPE model to Documents/rmvpe.safetensors")
-                    } else if extLower == "pth" || extLower == "pt" {
-                        if let arrays = try? PthConverter.shared.convert(url: file) {
-                            if (try? MLX.save(arrays: arrays, url: rmvpeDest)) != nil {
-                                try? fileManager.removeItem(at: file)
-                                log("Auto-converted RMVPE model to Documents/rmvpe.safetensors and removed source")
-                            }
-                        }
                     }
                 } else {
                     log("Documents/rmvpe.safetensors already exists and protected.")
-                }
-            }
-            
-            // 3. 一般の RVC ボイスモデル (.pth / .pt / .zip) の自動変換と元ファイル削除 (.index は厳重保護)
-            else if (extLower == "pth" || extLower == "pt" || extLower == "zip") && !nameLower.hasPrefix(".") {
-                let modelName = file.deletingPathExtension().lastPathComponent
-                let dest = docs.appendingPathComponent("\(modelName).safetensors")
-                if !fileManager.fileExists(atPath: dest.path) {
-                    if let arrays = try? PthConverter.shared.convert(url: file, copyIndexTo: docs) {
-                        if (try? MLX.save(arrays: arrays, url: dest)) != nil {
-                            try? fileManager.removeItem(at: file)
-                            log("Auto-converted voice model: \(file.lastPathComponent) -> \(dest.lastPathComponent) and removed source file.")
-                        }
-                    }
-                }
             }
         }
     }

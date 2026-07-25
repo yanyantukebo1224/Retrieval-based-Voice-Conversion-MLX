@@ -126,11 +126,22 @@ import MLXNN
                     }
                 }
                 
-                // Remap feature_extractor.conv_layers.X to feature_extractor.lX
+                // Remap feature_extractor.conv_layers.X.Y to feature_extractor.lX.conv/layer_norm
                 if newKey.hasPrefix("feature_extractor.conv_layers.") {
                     let parts = newKey.components(separatedBy: ".")
                     if parts.count >= 3, let idx = Int(parts[2]) {
-                        newKey = "feature_extractor.l\(idx)." + parts.dropFirst(3).joined(separator: ".")
+                        let subPath = parts.dropFirst(3).joined(separator: ".")
+                        if subPath == "0.weight" {
+                            newKey = "feature_extractor.l\(idx).conv.weight"
+                        } else if subPath == "0.bias" {
+                            newKey = "feature_extractor.l\(idx).conv.bias"
+                        } else if subPath == "2.weight" || subPath == "1.weight" {
+                            newKey = "feature_extractor.l\(idx).layer_norm.weight"
+                        } else if subPath == "2.bias" || subPath == "1.bias" {
+                            newKey = "feature_extractor.l\(idx).layer_norm.bias"
+                        } else {
+                            newKey = "feature_extractor.l\(idx)." + subPath
+                        }
                     }
                 }
 
