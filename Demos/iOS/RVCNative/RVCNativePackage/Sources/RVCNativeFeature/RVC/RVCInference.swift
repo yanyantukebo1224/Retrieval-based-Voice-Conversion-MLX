@@ -95,7 +95,7 @@ public class RVCInference: ObservableObject {
         var newParams: [String: MLXArray] = [:]
         for (k, v) in hubertWeights {
             var newKey = k
-            var val = v
+            let val = v
             
             // Repeatedly strip "model." or "hubert." prefix
             while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
@@ -131,12 +131,6 @@ public class RVCInference: ObservableObject {
                         newKey = "feature_extractor.l\(idx)." + subPath
                     }
                 }
-            }
-
-            // Fix Conv1d weight shape for MLX
-            if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
-                val = val.transposed(axes: [0, 2, 1])
-                log("RVCInference: Transposed \(newKey) to MLX Conv1d layout: \(val.shape)")
             }
             
             newParams[newKey] = val
@@ -276,7 +270,7 @@ public class RVCInference: ObservableObject {
         var synthParams: [String: MLXArray] = [:]
         for (k, v) in modelWeights {
             var newK = k
-            var newV = v
+            let newV = v
 
             if newK.contains("dec.ups.") {
                 newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_")
@@ -523,11 +517,7 @@ public class RVCInference: ObservableObject {
             cleanAudio = cleanAudio.flattened()
         }
         
-        // 【修正】MLXのConv1dが期待するチャンネルファースト形式 [Batch, Channels, Length] に整形する
-        var audioInput = cleanAudio.expandedDimensions(axis: 0).expandedDimensions(axis: 1)
-        if audioInput.ndim == 3 && audioInput.shape[2] == 1 {
-            audioInput = audioInput.transposed(axes: [0, 2, 1])
-        }
+        let audioInput = cleanAudio.expandedDimensions(axis: 0)
         
         guard let hubertModel = hubertModel else {
             throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
