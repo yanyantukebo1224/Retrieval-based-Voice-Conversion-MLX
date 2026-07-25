@@ -45,6 +45,7 @@ final class PickleUnpickler {
     private let NEWFALSE: UInt8 = 0x89
     private let NONE: UInt8 = 0x4E
     private let BINUNICODE: UInt8 = 0x58
+    private let SHORT_BINUNICODE: UInt8 = 0x8c
     private let BINFLOAT: UInt8 = 0x47
     
     // Protocol 4 & 5 Opcodes
@@ -352,6 +353,13 @@ final class PickleUnpickler {
         let val = data.subdata(in: position..<position+8).withUnsafeBytes { $0.load(as: Double.self) }
         position += 8
         return val
+    }
+    
+    private func readUInt64() throws -> UInt64 {
+        guard position + 8 <= data.count else { throw PickleError.stackUnderflow }
+        let val = data.subdata(in: position..<position+8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        position += 8
+        return val.bigEndian
     }
     
     private func buildTuple(opcode: UInt8) throws {

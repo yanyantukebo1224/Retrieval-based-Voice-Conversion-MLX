@@ -699,10 +699,10 @@ import MLXNN
             guard let hubertModel = hubertModel else {
                 throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "Hubert model missing"])
             }
-            var hubertFeatures: MLXArray!
-            autoreleasepool {
-                hubertFeatures = hubertModel(audioInput) // [1, Frames, 768]
-                MLX.eval(hubertFeatures)
+            let hubertFeatures: MLXArray = autoreleasepool {
+                let feat = hubertModel(audioInput) // [1, Frames, 768]
+                MLX.eval(feat)
+                return feat
             }
             GPU.clearCache()  // MEMORY FIX: Clear after HuBERT
             log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
