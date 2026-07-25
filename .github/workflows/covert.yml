@@ -25,7 +25,7 @@ jobs:
           def convert(url, out_name):
               print(f'Downloading {url}...')
               os.system(f'curl -L {url} -o temp.pt')
-              ckpt = torch.load('temp.pt', map_location='cpu')
+              ckpt = torch.load('temp.pt', map_location='cpu', weights_only=False)
               sd = ckpt.get('model', ckpt.get('state_dict', ckpt))
               clean_sd = {k: v.contiguous() for k, v in sd.items() if isinstance(v, torch.Tensor)}
               save_file(clean_sd, out_name)
