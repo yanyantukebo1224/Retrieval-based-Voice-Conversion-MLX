@@ -4,1033 +4,877 @@ import MLX
 import MLXRandom
 import MLXNN
 
-    @MainActor
-    public class RVCInference: ObservableObject {
-        public static let bundle = Bundle.module
-        @Published public var status: String = "Idle"
-        
-        // Callback for logging to UI
-        public var onLog: ((String) -> Void)?
-        
-        var hubertModel: HubertModel?
-        var synthesizer: Synthesizer?
-        var rmvpe: RMVPE?
-        var crepe: CREPE?
-        var dspPitch: DSPPitchExtractor?
-        var indexManager: IndexManager?
-        var indexRate: Float = 0.75
-        var modelSampleRate: Int = 40000  // Detected from model config
-        
-        private func log(_ message: String) {
-            print(message) // Keep console output
-            DispatchQueue.main.async {
-                self.onLog?(message)
-            }
-        }
-        
-        public init() {
-            log("RVCInference: Initializing...")
-            #if targetEnvironment(simulator)
-            MLX.Device.setDefault(device: Device.cpu)
-            log("RVCInference: Running on Simulator, forced CPU device.")
-            #endif
-        }
-
-        /// Unload all models to free memory
-        public func unloadModels() {
-            log("RVCInference: Unloading models...")
-            hubertModel = nil
-            synthesizer = nil
-            rmvpe = nil
-            crepe = nil
-            dspPitch = nil
-            indexManager?.unload()
-            indexManager = nil
-            status = "Idle"
-            log("RVCInference: Models unloaded.")
-        }
-
-        /// Load index vectors for speaker embedding retrieval.
-        ///
-        /// The index file should be a .safetensors file created by
-        /// `tools/convert_index_for_ios.py` from a FAISS .index file.
-        ///
-        /// - Parameters:
-        ///   - url: URL to the index .safetensors file
-        ///   - rate: Index blending rate (0.0-1.0, default 0.75)
-        public func loadIndex(url: URL, rate: Float = 0.75) throws {
-            log("RVCInference: Loading index from \(url.lastPathComponent)")
-            let manager = IndexManager()
-            
-            // Capture self strongly or weakly? 
-            // Since this is synchronous (load throws), we can just pass the closure.
-            // But log is on MainActor? No, print is safe. 
-            // Our internal log dispatches to main async.
-            try manager.load(url: url, logger: { [weak self] msg in
-                self?.log(msg)
-            })
-            
-            self.indexManager = manager
-            self.indexRate = rate
-            log("RVCInference: Index loaded with \(manager.count) vectors, rate=\(rate)")
-        }
-
-        /// Unload the index to free memory.
-        public func unloadIndex() {
-            indexManager?.unload()
-            indexManager = nil
-            log("RVCInference: Index unloaded.")
-        }
-
-        public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
-            DispatchQueue.main.async { self.status = "Loading models..." }
-            
-            // 1. Load Hubert
-            log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
-            var actualHubertURL = hubertURL
-            let hExt = hubertURL.pathExtension.lowercased()
-            if hExt == "pt" || hExt == "pth" {
-                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                let dest = docs.appendingPathComponent("hubert_base.safetensors")
-                if FileManager.default.fileExists(atPath: dest.path) {
-                    actualHubertURL = dest
-                } else if let arrays = try? PthConverter.shared.convert(url: hubertURL) {
-                    try? MLX.save(arrays: arrays, url: dest)
-                    actualHubertURL = dest
-                }
-            }
-            
-            let hubertWeights = try MLX.loadArrays(url: actualHubertURL)
-            log("RVCInference: Raw HuBERT file keys count: \(hubertWeights.count), sample keys: \(Array(hubertWeights.keys.prefix(10)))")
-
-            self.hubertModel = HubertModel(config: HubertConfig())
-            var newParams: [String: MLXArray] = [:]
-            for (k, v) in hubertWeights {
-                var newKey = k
-                var val = v
-                
-                // Repeatedly strip "model." or "hubert." prefix
-                while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
-                    if newKey.hasPrefix("model.") {
-                        newKey = String(newKey.dropFirst(6))
-                    } else if newKey.hasPrefix("hubert.") {
-                        newKey = String(newKey.dropFirst(7))
-                    }
-                }
-
-                // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
-                if newKey.hasPrefix("encoder.layers.") {
-                    let parts = newKey.components(separatedBy: ".")
-                    if parts.count >= 3, let idx = Int(parts[2]) {
-                        newKey = "encoder.l\(idx)." + parts.dropFirst(3).joined(separator: ".")
-                    }
-                }
-                
-                // Remap feature_extractor.conv_layers.X.Y to feature_extractor.lX.conv/layer_norm
-                if newKey.hasPrefix("feature_extractor.conv_layers.") {
-                    let parts = newKey.components(separatedBy: ".")
-                    if parts.count >= 3, let idx = Int(parts[2]) {
-                        let subPath = parts.dropFirst(3).joined(separator: ".")
-                        if subPath == "0.weight" {
-                            newKey = "feature_extractor.l\(idx).conv.weight"
-                        } else if subPath == "0.bias" {
-                            newKey = "feature_extractor.l\(idx).conv.bias"
-                        } else if subPath == "2.weight" || subPath == "1.weight" {
-                            newKey = "feature_extractor.l\(idx).layer_norm.weight"
-                        } else if subPath == "2.bias" || subPath == "1.bias" {
-                            newKey = "feature_extractor.l\(idx).layer_norm.bias"
-                        } else {
-                            newKey = "feature_extractor.l\(idx)." + subPath
-                        }
-                    }
-                }
-
-                // Fix Conv1d weight shape:
-                // PyTorch layout: [Out, In, K] (e.g. [512, 1, 10] or [512, 512, 2])
-                // MLX layout:     [Out, K, In] (e.g. [512, 10, 1] or [512, 2, 512])
-                if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
-                    let dim1 = val.shape[1]
-                    let dim2 = val.shape[2]
-                    // If dim2 is smaller (e.g. kernelSize 10, 3, 2) than dim1 (inChannels 512), it's PyTorch [Out, In, K]
-                    if dim2 < dim1 || (dim2 <= 10 && dim1 >= 512) {
-                        val = val.transposed(axes: [0, 2, 1])
-                        log("RVCInference: Transposed \(newKey) from PyTorch to MLX Conv1d layout: \(val.shape)")
-                    }
-                }
-                
-                newParams[newKey] = val
-            }
-            
-            // Fix HuBERT PosConv Weight Norm
-            let gKey = "encoder.pos_conv_embed.conv.weight_g"
-            let vKey = "encoder.pos_conv_embed.conv.weight_v"
-            let outKey = "encoder.pos_conv_embed.conv.weight"
-            
-            if let weight_g_raw = newParams[gKey], let weight_v_raw = newParams[vKey] {
-                 // PyTorch weight_v: (Out, In/Groups, Kernel) e.g. (768, 48, 128)
-                 // MLX weight_v:     (Out, Kernel, In/Groups) e.g. (768, 128, 48)
-                 let weight_v: MLXArray
-                 let weight_g: MLXArray
-                 if weight_v_raw.shape[1] < weight_v_raw.shape[2] {
-                     weight_v = weight_v_raw.transposed(axes: [0, 2, 1]) // (768, 128, 48)
-                     weight_g = weight_g_raw.transposed(axes: [0, 2, 1]) // (1, 128, 1)
-                 } else {
-                     weight_v = weight_v_raw
-                     weight_g = weight_g_raw
-                 }
-                 
-                 // Norm calculation (PyTorch dim=2 -> MLX axes [0, 2])
-                 let v_sqr = weight_v * weight_v
-                 let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true) // Result (1, 128, 1)
-                 let v_norm = sqrt(v_sum + 1e-12)
-                 let weight_normalized = weight_v / v_norm
-                 
-                 // Fuse
-                 let weight_fused = weight_g * weight_normalized
-                 
-                 newParams[outKey] = weight_fused
-                 newParams.removeValue(forKey: gKey)
-                 newParams.removeValue(forKey: vKey)
-                 log("RVCInference: Fused HuBERT PosConv weights (transposed, dim=2)")
-            }
-            log("RVCInference: Loaded \(newParams.count) HuBERT weights")
-            log("RVCInference: HuBERT sample keys: \(Array(newParams.keys.prefix(5)))")
-            
-            do {
-                self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
-                log("RVCInference: HuBERT parameters successfully updated.")
-            } catch {
-                log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
-            }
-            
-            // 2. Load Synthesizer (TextEncoder + Flow + Generator)
-            log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
-            let modelWeights = try MLX.loadArrays(url: modelURL)
-
-            // Note: The Python conversion script already transposes all weights to MLX format
-            // No additional transposition needed here!
-            log("RVCInference: Loaded \(modelWeights.count) weights (already in MLX format)")
-
-            // DEBUG: Print all dec.* keys to understand weight naming
-            let decKeys = modelWeights.keys.filter { $0.hasPrefix("dec.") }.sorted()
-            log("RVCInference: Generator weight keys: \(decKeys.prefix(20))...")  // Show first 20
-
-            // Read model config for architecture parameters
-            var detectedSR = self.modelSampleRate
-            var detectedUpsRates = [10, 10, 2, 2]
-            var detectedKernelSizes = [16, 16, 4, 4]
-
-            let configURL = modelURL.deletingPathExtension().appendingPathExtension("json")
-            if FileManager.default.fileExists(atPath: configURL.path) {
-                log("RVCInference: Found config at \(configURL.lastPathComponent)")
-                if let data = try? Data(contentsOf: configURL),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [Any] {
-                    if json.count > 17, let sr = json[17] as? Int {
-                        detectedSR = sr
-                        log("RVCInference: Detected Sample Rate \(detectedSR)Hz")
-                    }
-                    if json.count > 12, let uArr = json[12] as? [Any] {
-                        let u = uArr.compactMap { $0 as? Int }
-                        if !u.isEmpty {
-                            detectedUpsRates = u
-                            log("RVCInference: Detected Upsample Rates \(detectedUpsRates)")
-                        }
-                    }
-                    if json.count > 14, let kArr = json[14] as? [Any] {
-                        let k = kArr.compactMap { $0 as? Int }
-                        if !k.isEmpty {
-                            detectedKernelSizes = k
-                            log("RVCInference: Detected Kernel Sizes \(detectedKernelSizes)")
-                        }
-                    }
-                }
-            } else {
-                log("RVCInference: No config JSON found, detecting from weights...")
-            }
-
-            // CRITICAL: Detect/verify kernel sizes from actual weight shapes
-            // This ensures we use correct architecture even if JSON is missing or wrong
-            for i in 0..<4 {
-                let upKey = "dec.up_\(i).weight"
-                if let upWeight = modelWeights[upKey] {
-                    // Weight shape is (Out, K, In) in MLX format
-                    let detectedK = upWeight.shape[1]
-                    if detectedK != detectedKernelSizes[i] {
-                        log("RVCInference: ⚠️ Kernel mismatch for up_\(i): config=\(detectedKernelSizes[i]), weight=\(detectedK). Using weight value.")
-                        detectedKernelSizes[i] = detectedK
-
-                        // Also infer stride from kernel size for common HiFi-GAN patterns
-                        // kernel=24 typically means stride=12 (48kHz models)
-                        // kernel=20 typically means stride=10
-                        // kernel=16 typically means stride=10 (original 32kHz models)
-                        // kernel=4 typically means stride=2
-                        if i < 2 {  // Only adjust first two layers (which vary more)
-                            let inferredStride: Int
-                            switch detectedK {
-                            case 24: inferredStride = 12
-                            case 20: inferredStride = 10
-                            case 16: inferredStride = 10
-                            default: inferredStride = detectedUpsRates[i]  // Keep existing
-                            }
-                            if inferredStride != detectedUpsRates[i] {
-                                log("RVCInference: ⚠️ Inferring stride for up_\(i) from kernel=\(detectedK): stride=\(inferredStride)")
-                                detectedUpsRates[i] = inferredStride
-                            }
-                        }
-                    }
-                }
-            }
-            log("RVCInference: Final architecture - upsampleRates=\(detectedUpsRates), kernelSizes=\(detectedKernelSizes), sampleRate=\(detectedSR)")
-
-            // Initialize Synthesizer with architecture from config
-            self.synthesizer = Synthesizer(
-                interChannels: 192,
-                hiddenChannels: 192,
-                filterChannels: 768,
-                nHeads: 2,
-                nLayers: 6,
-                kernelSize: 3,
-                pDropout: 0.0,
-                embeddingDim: 768,
-                speakerEmbedDim: 256,
-                ginChannels: 256,
-                useF0: true,
-                upsampleRates: detectedUpsRates,
-                upsampleKernelSizes: detectedKernelSizes,
-                sampleRate: detectedSR
-            )
-            
-            // Store sample rate for use during inference
-            self.modelSampleRate = detectedSR
-            
-            // Remap keys for Synthesizer
-            // RVC V2 PyTorch Weights:
-            // enc_p.* -> TextEncoder
-            // dec.* -> Generator
-            // flow.flows.0, 2, 4, 6 -> Flow (indices 0, 1, 2, 3)
-            // emb_g.weight -> Speaker Embedding
-
-            // Helper: Check if a key needs .conv inserted (for Conv1d wrapper classes)
-            func needsConvInsertion(_ key: String) -> Bool {
-                // Generator Conv1d wrappers (NOT ConvTranspose1d - now using native)
-                if key.hasPrefix("dec.conv_pre.") || key.hasPrefix("dec.conv_post.") { return true }
-                // dec.up_* uses native ConvTransposed1d, no .conv wrapper
-                if key.contains("dec.noise_conv_") { return true }
-                if key.contains("dec.resblock_") && (key.contains(".c1_") || key.contains(".c2_")) { return true }
-                return false
-            }
-
-            // Helper: Check if this is a ConvTranspose1d weight that needs kernel flip
-            // Handle both naming conventions: dec.up_0.weight OR dec.ups.0.weight
-            func isConvTransposeWeight(_ key: String) -> Bool {
-                let isUpWeight = (key.contains("dec.up_") || key.contains("dec.ups.")) && key.hasSuffix(".weight")
-                return isUpWeight
-            }
-
-            var synthParams: [String: MLXArray] = [:]
-            for (k, v) in modelWeights {
-                var newK = k
-                var newV = v
-
-                // 1. Remap PyTorch-style Generator keys to match Swift structure
-                // dec.ups.X -> dec.up_X
-                if newK.contains("dec.ups.") {
-                    newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_")
-                }
-                // dec.noise_convs.X -> dec.noise_conv_X
-                if newK.contains("dec.noise_convs.") {
-                    newK = newK.replacingOccurrences(of: "dec.noise_convs.", with: "dec.noise_conv_")
-                }
-                // dec.resblocks.X.convs1.Y -> dec.resblock_X.c1_Y
-                if newK.contains("dec.resblocks.") {
-                    newK = newK.replacingOccurrences(of: "dec.resblocks.", with: "dec.resblock_")
-                    newK = newK.replacingOccurrences(of: ".convs1.", with: ".c1_")
-                    newK = newK.replacingOccurrences(of: ".convs2.", with: ".c2_")
-                }
-
-                // 1b. Remap fused resblock conv weights: dec.resblock_X.c1_Y.weight -> dec.resblock_X.c1_Y.conv.weight
-                // Swift's Conv1d wrapper has a nested .conv property
-                if newK.contains("dec.resblock_") && (newK.contains(".c1_") || newK.contains(".c2_")) {
-                    let oldKey = newK
-                    if newK.hasSuffix(".weight") && !newK.contains(".conv.") {
-                        newK = newK.replacingOccurrences(of: ".weight", with: ".conv.weight")
-                        if oldKey.contains("c1_0") && oldKey.contains("resblock_0") {
-                            log("DEBUG: Remapped resblock key: \(oldKey) -> \(newK)")
-                        }
-                    }
-                    if newK.hasSuffix(".bias") && !newK.contains(".conv.") {
-                        newK = newK.replacingOccurrences(of: ".bias", with: ".conv.bias")
-                    }
-                }
-
-                // 1c. Remap TextEncoder encoder keys: attn_X -> attn_layers.X, norm1_X -> norm_layers_1.X, etc.
-                // Python: setattr(self, f"attn_{i}", l) creates enc_p.encoder.attn_0
-                // Swift: uses arrays like enc_p.encoder.attn_layers.0
-                if newK.contains("enc_p.encoder.") {
-                    // Remap layer names: attn_X -> attn_layers.X, etc.
-                    for i in 0..<6 {  // Assuming max 6 layers
-                        newK = newK.replacingOccurrences(of: "encoder.attn_\(i).", with: "encoder.attn_layers.\(i).")
-                        newK = newK.replacingOccurrences(of: "encoder.norm1_\(i).", with: "encoder.norm_layers_1.\(i).")
-                        newK = newK.replacingOccurrences(of: "encoder.ffn_\(i).", with: "encoder.ffn_layers.\(i).")
-                        newK = newK.replacingOccurrences(of: "encoder.norm2_\(i).", with: "encoder.norm_layers_2.\(i).")
-                    }
-                }
-
-                // 2. Flow weight keys now match directly: flow.flow_0, flow.flow_1, etc.
-                // No remapping needed - Swift structure uses flow_0, flow_1, etc. properties
-
-                // 3. DON'T flip kernel - the conversion script already handled transposition
-                // Testing: The manual ConvTranspose1d implementation might not need kernel flip
-                // if isConvTransposeWeight(k) && newV.ndim == 3 {
-                //     newV = newV[0..., .stride(by: -1), 0...]
-                //     log("RVCInference: Flipped kernel for \(k)")
-                // }
-
-                // 4. Insert .conv for Conv1d wrapper classes in Generator
-                // IMPORTANT: Check !contains(".conv.") to prevent double insertion (resblocks handled in section 1b)
-                if needsConvInsertion(newK) && !newK.contains(".conv.") {
-                    if newK.hasSuffix(".weight") {
-                        newK = String(newK.dropLast(7)) + ".conv.weight"
-                    } else if newK.hasSuffix(".bias") {
-                        newK = String(newK.dropLast(5)) + ".conv.bias"
-                    }
-                }
-
-                if newK.contains("enc_p.emb_pitch") {
-                    log("DEBUG: check - Found Pitch Embedding Key: \(newK)")
-                }
-                
-                synthParams[newK] = newV
-            }
-
-            log("RVCInference: About to load \(synthParams.count) parameters into Synthesizer")
-
-            // DEBUG: Show sample of remapped resblock keys
-            let resblockKeys = synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted()
-            log("DEBUG: Resblock_0.c1_0 keys after remapping: \(resblockKeys)")
-
-            // DEBUG: Show all NSF (m_source) related keys
-            let nsfKeys = synthParams.keys.filter { $0.contains("m_source") }.sorted()
-            log("DEBUG: All m_source (NSF) keys in model: \(nsfKeys)")
-
-            // 5. CRITICAL: Fuse weight normalization for ConvTransposed1d layers
-            // PyTorch weight normalization: weight = g * (v / ||v||)
-            // where g is weight_g and v is weight_v
-            for i in 0..<4 {
-                let gKey = "dec.up_\(i).weight_g"
-                let vKey = "dec.up_\(i).weight_v"
-                let outKey = "dec.up_\(i).weight"
-                
-                if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                    // Compute L2 norm of weight_v along output channel axis (axis 0)
-                    // weight_v shape: (out_channels, kernel_size, in_channels) in MLX format
-                    let v_sqr = weight_v * weight_v
-                    let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)  // Sum over kernel and in_channels
-                    let v_norm = sqrt(v_sum + 1e-12)  // Add epsilon for numerical stability
-                    
-                    // Normalize and scale
-                    let weight_normalized = weight_v / v_norm
-                    let weight_fused = weight_g * weight_normalized
-                    
-                    synthParams[outKey] = weight_fused
-                    log("RVCInference: Fused weight_g \(weight_g.shape) + weight_v \(weight_v.shape) -> \(outKey) \(weight_fused.shape)")
-                    
-                    // Remove the separate g/v keys
-                    synthParams.removeValue(forKey: gKey)
-                    synthParams.removeValue(forKey: vKey)
-                }
-            }
-            
-            // Also fuse weight normalization for resblock convolutions if present
-            for i in 0..<12 {
-                for (convPrefix, convCount) in [("c1_", 3), ("c2_", 3)] {
-                    for j in 0..<convCount {
-                        let base = "dec.resblock_\(i).\(convPrefix)\(j)"
-                        let gKey = "\(base).weight_g"
-                        let vKey = "\(base).weight_v"
-                        let outKey = "\(base).conv.weight"
-                        
-                        if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                            // For Conv1d: weight_v shape (out_channels, kernel, in_channels)
-                            let v_sqr = weight_v * weight_v
-                            let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
-                            let v_norm = sqrt(v_sum + 1e-12)
-                            
-                            let weight_normalized = weight_v / v_norm
-                            let weight_fused = weight_g * weight_normalized
-                            
-                            synthParams[outKey] = weight_fused
-                            // Remove the separate g/v keys
-                            synthParams.removeValue(forKey: gKey)
-                            synthParams.removeValue(forKey: vKey)
-                        }
-                    }
-                }
-            }
-            
-            log("RVCInference: After weight fusion: \(synthParams.count) parameters")
-            log("RVCInference: Generator up_0 weight shape in file: \(synthParams["dec.up_0.weight"]?.shape ?? [])")
-
-            // DEBUG: Check emb_phone weight in synthParams BEFORE loading
-            if let embPhoneWeight = synthParams["enc_p.emb_phone.weight"] {
-                MLX.eval(embPhoneWeight)
-                log("DEBUG: synthParams[enc_p.emb_phone.weight] BEFORE update: shape=\(embPhoneWeight.shape), range=[\(embPhoneWeight.min().item(Float.self))...\(embPhoneWeight.max().item(Float.self))]")
-            } else {
-                log("DEBUG: synthParams[enc_p.emb_phone.weight] NOT FOUND!")
-            }
-
-            // DEBUG: Check NSF module weights BEFORE loading
-            if let nsfWeight = synthParams["dec.m_source.l_linear.weight"] {
-                MLX.eval(nsfWeight)
-                log("DEBUG: synthParams[dec.m_source.l_linear.weight] BEFORE update: shape=\(nsfWeight.shape), range=[\(nsfWeight.min().item(Float.self))...\(nsfWeight.max().item(Float.self))]")
-            } else {
-                log("DEBUG: synthParams[dec.m_source.l_linear.weight] NOT FOUND - NSF will use init weights!")
-            }
-            if let nsfBias = synthParams["dec.m_source.l_linear.bias"] {
-                MLX.eval(nsfBias)
-                log("DEBUG: synthParams[dec.m_source.l_linear.bias] BEFORE update: shape=\(nsfBias.shape), value=\(nsfBias.asArray(Float.self))")
-            } else {
-                log("DEBUG: synthParams[dec.m_source.l_linear.bias] NOT FOUND - NSF will use init bias!")
-            }
-
-            do {
-                self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
-                self.synthesizer?.train(false)
-                log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
-            } catch {
-                log("RVCInference: ⚠️ Error updating Synthesizer parameters: \(error)")
-            }
-
-            // DEBUG: Verify weights are loaded correctly
-            if let synth = self.synthesizer {
-                // Check TextEncoder weights
-                let emb_phone = synth.enc_p.emb_phone.weight
-                log("DEBUG: enc_p.emb_phone.weight: shape=\(emb_phone.shape), range=[\(emb_phone.min().item(Float.self))...\(emb_phone.max().item(Float.self))]")
-                if let emb_pitch = synth.enc_p.emb_pitch {
-                    let w = emb_pitch.weight
-                    log("DEBUG: enc_p.emb_pitch.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
-                }
-
-                // Check Generator resblock weights - CRITICAL for detecting weight loading issues
-                let w0 = synth.dec.resblock_0.c1_0.conv.weight
-                MLX.eval(w0)
-                log("DEBUG: resblock_0.c1_0.conv.weight (kernel=3): shape=\(w0.shape), range=[\(w0.min().item(Float.self))...\(w0.max().item(Float.self))], mean=\(w0.mean().item(Float.self))")
-                log("DEBUG: EXPECTED from Drake.safetensors: shape=(256, 3, 256), range=[-0.44, 0.66], mean=-0.0013")
-
-                // Compare with what was in synthParams before loading
-                if let fileW0 = synthParams["dec.resblock_0.c1_0.conv.weight"] {
-                    MLX.eval(fileW0)
-                    log("DEBUG: synthParams key found! File weight range=[\(fileW0.min().item(Float.self))...\(fileW0.max().item(Float.self))]")
-                } else {
-                    log("DEBUG: WARNING - synthParams[dec.resblock_0.c1_0.conv.weight] NOT FOUND! Weights may not be loading correctly!")
-                    log("DEBUG: Available dec.resblock_0 keys: \(synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted())")
-                }
-
-                // Check Flow weights are loaded
-                let flowCondW = synth.flow.flow_0.enc.cond_layer?.weight
-                if let w = flowCondW {
-                    log("DEBUG: flow.flow_0.enc.cond_layer.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
-                } else {
-                    log("DEBUG: flow.flow_0.enc.cond_layer is nil!")
-                }
-                let flowIn0W = synth.flow.flow_0.enc.in_layer_0.weight
-                log("DEBUG: flow.flow_0.enc.in_layer_0.weight: shape=\(flowIn0W.shape), range=[\(flowIn0W.min().item(Float.self))...\(flowIn0W.max().item(Float.self))]")
-
-                // DEBUG: Check NSF module weights AFTER loading
-                let nsfW = synth.dec.m_source.l_linear.weight
-                MLX.eval(nsfW)
-                log("DEBUG: dec.m_source.l_linear.weight AFTER load: shape=\(nsfW.shape), values=\(nsfW.asArray(Float.self))")
-                if let nsfB = synth.dec.m_source.l_linear.bias {
-                    MLX.eval(nsfB)
-                    log("DEBUG: dec.m_source.l_linear.bias AFTER load: shape=\(nsfB.shape), values=\(nsfB.asArray(Float.self))")
-                } else {
-                    log("DEBUG: dec.m_source.l_linear.bias is nil (no bias)")
-                }
-            }
-            
-            // 3. Load RMVPE (Optional)
-            if let rmvpeURL = rmvpeURL {
-                do {
-                    log("RVCInference: Loading RMVPE from \(rmvpeURL.lastPathComponent)")
-                    let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
-                    self.rmvpe = RMVPE()
-                    
-                    // Remap RMVPE weight keys (Python MLX format -> Swift)
-                    var remappedRMVPE: [String: MLXArray] = [:]
-                    for (k, v) in rmvpeWeights {
-                        var newKey = k
-                        
-                        // Skip batch tracking stats
-                        if newKey.contains("num_batches_tracked") {
-                            continue
-                        }
-                        
-                        // Remap fc.bigru.forward_grus.0 -> bigru.fwd0
-                        if newKey.hasPrefix("fc.bigru.forward_grus.0.") {
-                            newKey = "bigru.fwd0." + String(newKey.dropFirst("fc.bigru.forward_grus.0.".count))
-                        }
-                        
-                        // Remap fc.bigru.backward_grus.0 -> bigru.bwd0
-                        if newKey.hasPrefix("fc.bigru.backward_grus.0.") {
-                            newKey = "bigru.bwd0." + String(newKey.dropFirst("fc.bigru.backward_grus.0.".count))
-                        }
-                        
-                        // Remap fc.linear -> linear
-                        if newKey.hasPrefix("fc.linear.") {
-                            newKey = "linear." + String(newKey.dropFirst("fc.linear.".count))
-                        }
-                        
-                        // Remap blocks.X -> bX (for ResEncoder/Decoder blocks)
-                        newKey = newKey.replacingOccurrences(of: ".blocks.0.", with: ".b0.")
-                        newKey = newKey.replacingOccurrences(of: ".blocks.1.", with: ".b1.")
-                        newKey = newKey.replacingOccurrences(of: ".blocks.2.", with: ".b2.")
-                        newKey = newKey.replacingOccurrences(of: ".blocks.3.", with: ".b3.")
-                        
-                        // Remap unet.encoder.layers.X -> unet.encoder.lX
-                        if newKey.contains(".layers.") {
-                            newKey = newKey.replacingOccurrences(of: ".layers.0.", with: ".l0.")
-                            newKey = newKey.replacingOccurrences(of: ".layers.1.", with: ".l1.")
-                            newKey = newKey.replacingOccurrences(of: ".layers.2.", with: ".l2.")
-                            newKey = newKey.replacingOccurrences(of: ".layers.3.", with: ".l3.")
-                            newKey = newKey.replacingOccurrences(of: ".layers.4.", with: ".l4.")
-                        }
-                        
-                        // Remap BatchNorm running stats (snake_case from PyTorch/SafeTensors -> camelCase for Swift MLX)
-                        // This is CRITICAL: unmatched keys mean BN uses init stats (mean=0, var=1), destroying signal scale
-                        if newKey.contains("running_mean") {
-                            print("DEBUG: Remapping running_mean found: \(newKey)")
-                        }
-                        newKey = newKey.replacingOccurrences(of: ".running_mean", with: ".runningMean")
-                        newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
-                        
-                        if newKey.contains("runningMean") {
-                            print("DEBUG: Remapped to runningMean: \(newKey)")
-                        }
-
-                        // Fix RMVPE 4D Conv2d weight layout: PyTorch [Out, In, H, W] -> MLX [Out, H, W, In]
-                        var val = v
-                        if newKey.hasSuffix(".weight") && val.ndim == 4 {
-                            val = val.transposed(axes: [0, 2, 3, 1])
-                        }
-                        
-                        remappedRMVPE[newKey] = val
-                    }
-                    
-                    log("RVCInference: RMVPE sample keys after remapping: \(Array(remappedRMVPE.keys.prefix(5)))")
-
-                    // Check if running stats are in the remapped dict
-                    let bnRunningKeys = remappedRMVPE.keys.filter { $0.contains("encoder.bn.running") }
-                    log("RVCInference: BN running stat keys to load: \(bnRunningKeys)")
-                    if let rmKey = remappedRMVPE["unet.encoder.bn.runningMean"] {
-                        log("RVCInference: encoder.bn.runningMean value: \(rmKey.asArray(Float.self))")
-                    }
-                    if let rvKey = remappedRMVPE["unet.encoder.bn.runningVar"] {
-                        log("RVCInference: encoder.bn.runningVar value: \(rvKey.asArray(Float.self))")
-                    }
-
-                    do {
-                        self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
-                        log("RVCInference: RMVPE parameters successfully updated.")
-                    } catch {
-                        log("RVCInference: ⚠️ Error updating RMVPE parameters: \(error)")
-                    }
-                    self.rmvpe?.setTrainingMode(false)  // CRITICAL: Set to eval mode for correct inference
-
-                    log("RVCInference: ✅ RMVPE loaded with CustomBatchNorm (\(remappedRMVPE.count) keys)")
-                } catch {
-                    log("RVCInference: Failed to load RMVPE: \(error). Using fallback F0.")
-                    self.rmvpe = nil
-                }
-            } else {
-                log("RVCInference: No RMVPE URL provided. Using fallback F0.")
-            }
-
-            // 4. Load CREPE (Optional)
-            if let crepeURL = crepeURL {
-                do {
-                    log("RVCInference: Loading CREPE from \(crepeURL.lastPathComponent)")
-                    self.crepe = try CREPE(weightsURL: crepeURL, modelType: "full")
-                    log("RVCInference: ✅ CREPE loaded successfully")
-                } catch {
-                    log("RVCInference: Failed to load CREPE: \(error). CREPE will not be available.")
-                    self.crepe = nil
-                }
-            } else {
-                log("RVCInference: No CREPE URL provided. CREPE will not be available.")
-            }
-
-            // Also set HuBERT to eval mode
-            self.hubertModel?.train(false)
-            
-            DispatchQueue.main.async { self.status = "Models Loaded" }
-        }
-        
-        public func infer(
-            audioURL: URL,
-            outputURL: URL,
-            pitchShift: Int = 0,           // Semitones (-12 to +12)
-            f0Method: String = "rmvpe",    // F0 extraction method
-            indexRate: Float = 0.75,       // Feature retrieval blend
-            volumeEnvelope: Float = 1.0
-        ) async {
-            do {
-                DispatchQueue.main.async { self.status = "Loading Audio..." }
-                
-                // Load whole audio (Float array size is fine, just not tensors)
-                let (audioArray, _) = try AudioProcessor.shared.loadAudio(url: audioURL)
-                // audioArray: [TotalSamples]
-                
-                let totalSamples = audioArray.size
-                log("RVCInference: Processing \(totalSamples) samples (\(Float(totalSamples)/16000.0)s at 16kHz)")
-                
-                DispatchQueue.main.async { self.status = "Processing..." }
-                
-                // Process entire audio in one pass (simpler, avoids chunk boundary artifacts)
-                // For iOS memory constraints, we limit to ~30s audio for now
-                let maxSamples = 16000 * 30  // 30 seconds at 16kHz
-                var audioToProcess = audioArray
-                if totalSamples > maxSamples {
-                    log("RVCInference: Audio too long (\(totalSamples) samples), truncating to \(maxSamples)")
-                    audioToProcess = audioArray[0..<maxSamples]
-                }
-                
-                // Apply high-pass filter (Butterworth 5th order, 48Hz)
-                // Matches Python: signal.butter(5, 48, btype="high", fs=16000) + filtfilt
-                audioToProcess = applyButterworthHighPass(audioToProcess)
-                
-                // Add padding for model context (1s each side, reflect mode)
-                // Matches Python: np.pad(audio, (16000, 16000), mode="reflect")
-                let padSamples = 1600
-                let audioPadded = padReflect(audioToProcess, padding: padSamples)
-                
-                // Run inference on full audio
-                let outputPadded = try await inferChunk(
-                    chunk: audioPadded,
-                    pitchShift: pitchShift,
-                    f0Method: f0Method,
-                    indexRate: indexRate
-                )
-                MLX.eval(outputPadded)
-                
-                // Calculate crop to remove padding from output
-                // Input is at 16kHz, output is at model sample rate
-                let outputRatio: Float = Float(self.modelSampleRate) / 16000.0
-                let cropSamples = Int(Float(padSamples) * outputRatio)
-                
-                let outputLen = outputPadded.shape[1]
-                let coreStart = cropSamples
-                let coreEnd = outputLen - cropSamples
-                
-                var finalOutput: MLXArray
-                if coreEnd > coreStart {
-                    finalOutput = outputPadded[0..., coreStart..<coreEnd, 0...].squeezed(axes: [0, 2])
-                } else {
-                    // Fallback if output is too short
-                    finalOutput = outputPadded.squeezed(axes: [0, 2])
-                }
-                
-                MLX.eval(finalOutput)
-
-                // Apply volume envelope scaling
-                if volumeEnvelope != 1.0 {
-                    finalOutput = finalOutput * volumeEnvelope
-                    MLX.eval(finalOutput)
-                }
-
-                let outputSampleRate: Double = Double(self.modelSampleRate)
-
-                log("RVCInference: Saving \(finalOutput.size) samples to \(outputURL.path)")
-                try AudioProcessor.shared.saveAudio(array: finalOutput, url: outputURL, sampleRate: outputSampleRate)
-                
-                log("RVCInference: Done!")
-                DispatchQueue.main.async { self.status = "Done!" }
-                
-            } catch {
-                log("RVCInference Error: \(error)")
-                DispatchQueue.main.async { self.status = "Error: \(error.localizedDescription)" }
-            }
-        }
-        
-        private func inferChunk(
-            chunk: MLXArray,
-            pitchShift: Int,
-            f0Method: String,
-            indexRate: Float
-        ) async throws -> MLXArray {
-            // 1. Audio input validation & shape safety
-            var cleanAudio = chunk
-            if cleanAudio.ndim == 2 {
-                cleanAudio = cleanAudio.mean(axis: 0) // Convert stereo to mono
-            }
-            if cleanAudio.ndim != 1 {
-                cleanAudio = cleanAudio.flattened()
-            }
-            
-            // DEBUG: Log audio input stats
-            log("DEBUG: Audio input - shape: \(cleanAudio.shape), min: \(cleanAudio.min().item(Float.self)), max: \(cleanAudio.max().item(Float.self)), mean: \(cleanAudio.mean().item(Float.self))")
-            
-            // Log first 20 audio samples
-            let audioSlice = cleanAudio[0..<min(20, cleanAudio.shape[0])].asType(Float.self)
-            MLX.eval(audioSlice)
-            let audioSamples = audioSlice.asArray(Float.self)
-            log("DEBUG: Audio input (padded, filtered) first 20 samples: \(audioSamples)")
-             
-            // 2. Hubert Feature Extraction (16kHz -> 50fps)
-            let audioInput = cleanAudio.expandedDimensions(axis: 0) // [1, T]
-            guard let hubertModel = hubertModel else {
-                throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded. Please ensure hubert_base.safetensors exists in Documents."])
-            }
-            let hubertFeatures: MLXArray = autoreleasepool {
-                let feat = hubertModel(audioInput) // [1, Frames, 768]
-                MLX.eval(feat)
-                return feat
-            }
-            GPU.clearCache()  // MEMORY FIX: Clear after HuBERT
-            log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
-            
-            // DEBUG: Log first HuBERT frame's first 5 features
-            autoreleasepool {
-                let hubertSlice = hubertFeatures[0, 0, 0..<5].asType(Float.self)
-                MLX.eval(hubertSlice)
-                let hubertSamples = hubertSlice.asArray(Float.self)
-                log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
-            }
-
-            // 3. F0 Estimation (16kHz -> 100fps)
-            var f0: MLXArray
-            switch f0Method.lowercased() {
-            case "crepe", "crepe-full":
-                if let crepe = crepe {
-                    f0 = crepe.getF0(audio: cleanAudio, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
-                    log("DEBUG: CREPE F0 shape: \(f0.shape)")
-                } else if let rmvpe = rmvpe {
-                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-                } else {
-                    let frames = hubertFeatures.shape[1] * 2
-                    f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-                }
-
-            case "rmvpe":
-                if let rmvpe = rmvpe {
-                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-                } else {
-                    log("WARN: RMVPE not loaded, using fallback F0")
-                    let frames = hubertFeatures.shape[1] * 2
-                    f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-                }
-
-            default:
-                if let rmvpe = rmvpe {
-                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-                } else {
-                    let frames = hubertFeatures.shape[1] * 2
-                    f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-                }
-            }
-            MLX.eval(f0)
-            GPU.clearCache()  // MEMORY FIX: Clear after F0 estimation
-            
-            // 4. Upsample Hubert Features & Strict Frame Alignment
-            let N = hubertFeatures.shape[0]
-            let L = hubertFeatures.shape[1]
-            let C = hubertFeatures.shape[2]
-            
-            let expanded = hubertFeatures.expandedDimensions(axis: 2)
-            let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
-            var phone = broadcasted.reshaped([N, L * 2, C])
-            
-            // Length Guard: Align phone & f0 length exactly
-            let phoneLen = phone.shape[1]
-            let f0Len = f0.shape[1]
-            let minLen = min(phoneLen, f0Len)
-            
-            if phoneLen != minLen {
-                phone = phone[0..., 0..<minLen, 0...]
-            }
-            if f0Len != minLen {
-                f0 = f0[0..., 0..<minLen, 0...]
-            }
-            log("DEBUG: Aligned phone shape: \(phone.shape), f0 shape: \(f0.shape)")
-
-            // 5. Optional FAISS Index Retrieval
-            if indexRate > 0, let indexManager = indexManager {
-                phone = indexManager.search(features: phone, indexRate: indexRate)
-                log("DEBUG: FAISS Index retrieval completed with rate \(indexRate)")
-            }
-
-            // 6. Pitch Quantization & Synthesizer Inference
-            guard let synth = synthesizer else {
-                throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded in Synthesizer"])
-            }
-
-            // Compute coarse pitch buckets (Hz -> Bucket 1-255)
-            var f0Hz = f0.squeezed(axes: [2]) // [1, minLen]
-            if pitchShift != 0 {
-                let multiplier = pow(2.0, Float(pitchShift) / 12.0)
-                f0Hz = f0Hz * multiplier
-            }
-            let f0_min: Float = 50.0
-            let f0_max: Float = 1100.0
-            let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
-            let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
-            let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
-            var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
-            pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
-            pitch = MLX.maximum(pitch, 1.0)
-            pitch = MLX.minimum(pitch, 255.0)
-            let pitchBuckets = pitch.asType(Int32.self)
-            
-            let nsff0 = f0Hz.expandedDimensions(axis: 2)
-            let phoneLengths = MLXArray([Int32(minLen)])
-            let sid = MLXArray([Int32(0)])
-
-            let audioConverted: MLXArray = try autoreleasepool {
-                let out = synth.infer(
-                    phone: phone,
-                    phoneLengths: phoneLengths,
-                    pitch: pitchBuckets,
-                    nsff0: nsff0,
-                    sid: sid
-                )
-                MLX.eval(out)
-                return out
-            }
-            GPU.clearCache()
-
-            return audioConverted
-        }
-
-        /// Run benchmark: perform inference and compare with reference audio
-        public func runBenchmark(audioURL: URL, referenceURL: URL?, outputURL: URL) async throws -> String {
-            // Run inference
-            await infer(audioURL: audioURL, outputURL: outputURL)
-
-            // If reference provided, compare using Python script
-            guard let refURL = referenceURL else {
-                return "Inference completed. No reference provided for comparison."
-            }
-
-            #if os(macOS)
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            task.arguments = [
-                "tools/compare_wavs.py",
-                refURL.path,
-                outputURL.path
-            ]
-
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = pipe
-
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else {
-                return "Failed to read comparison output"
-            }
-
-            return output
-            #else
-            // Process is not available on iOS
-            return "Inference completed. Reference comparison not available on iOS (reference: \(refURL.lastPathComponent))."
-            #endif
-        }
-        
-        /// Apply high-pass filter: Butterworth 5th order, 48Hz cut-off, 16kHz sample rate
-        /// Matches scipy.signal.butter(5, 48, btype='high', fs=16000)
-        /// Uses forward-backward filtering (filtfilt) for zero phase shift
-        private func applyButterworthHighPass(_ audio: MLXArray) -> MLXArray {
-            // Coefficients for butter(5, 48, fs=16000)
-            let b: [Double] = [0.9699606451838447, -4.849803225919223, 9.699606451838447, -9.699606451838447, 4.849803225919223, -0.9699606451838447]
-            let a: [Double] = [1.0, -4.939001819168364, 9.757863526739543, -9.639544849413458, 4.761506797356209, -0.9408236532054606]
-            
-            // Extract samples to CPU and convert to Double for precision
-            MLX.eval(audio)
-            let samplesFloat = audio.asArray(Float.self)
-            let samples = samplesFloat.map { Double($0) }
-            
-            // Helper for simple Direct Form II filtering
-            func filter(_ x: [Double]) -> [Double] {
-                var y = [Double](repeating: 0, count: x.count)
-                
-                // Direct Form I difference equation:
-                // y[n] = b0*x[n] + ... + b5*x[n-5] - a1*y[n-1] - ... - a5*y[n-5]
-                // Assumes a[0] = 1.0
-                
-                for n in 0..<x.count {
-                    // Feedforward
-                    var val = b[0] * x[n]
-                    if n > 0 { val += b[1] * x[n-1] }
-                    if n > 1 { val += b[2] * x[n-2] }
-                    if n > 2 { val += b[3] * x[n-3] }
-                    if n > 3 { val += b[4] * x[n-4] }
-                    if n > 4 { val += b[5] * x[n-5] }
-                    
-                    // Feedback
-                    if n > 0 { val -= a[1] * y[n-1] }
-                    if n > 1 { val -= a[2] * y[n-2] }
-                    if n > 2 { val -= a[3] * y[n-3] }
-                    if n > 3 { val -= a[4] * y[n-4] }
-                    if n > 4 { val -= a[5] * y[n-5] }
-                    
-                    y[n] = val
-                }
-                return y
-            }
-            
-            // Forward pass
-            let y_fwd = filter(samples)
-            
-            // Backward pass (reverse, filter, reverse)
-            let y_rev = Array(y_fwd.reversed())
-            let y_back = filter(y_rev)
-            let y_final = Array(y_back.reversed())
-            
-            // Convert back to Float
-            let resultFloat = y_final.map { Float($0) }
-            return MLXArray(resultFloat)
-        }
-        
-        /// Manual reflect padding matching numpy.pad(mode='reflect')
-        /// Pads with the reflection of the vector mirrored on the first and last values of the vector
-        private func padReflect(_ audio: MLXArray, padding: Int) -> MLXArray {
-            MLX.eval(audio)
-            let samples = audio.asArray(Float.self)
-            let n = samples.count
-            
-            guard n > 1 else { return audio }
-            
-            // Left pad: reverse of samples[1...padding]
-            // If padding > n, this simple logic fails, but we assume padding < n (16000 < 30s audio)
-            // Python: pad=2, [0,1,2] -> [2,1, 0,1,2]
-            
-            var leftPad: [Float] = []
-            if padding > 0 {
-                // indices: 1 to padding
-                let start = 1
-                let end = min(padding, n - 1)
-                if end >= start {
-                    leftPad = Array(samples[start...end].reversed())
-                }
-            }
-            
-            var rightPad: [Float] = []
-            if padding > 0 {
-                // indices: (n-1-padding) to (n-2)
-                // Python: pad=2, [0,1,2] -> [0,1,2, 1,0]
-                // indices reflected around last element (2): 1, 0
-                // indices: n-2 down to n-1-padding
-                
-                let start = max(0, n - 1 - padding)
-                let end = n - 2
-                if end >= start {
-                    rightPad = Array(samples[start...end].reversed())
-                }
-            }
-            
-            let result = leftPad + samples + rightPad
-            return MLXArray(result)
+@MainActor
+public class RVCInference: ObservableObject {
+    public static let bundle = Bundle.module
+    @Published public var status: String = "Idle"
+    
+    // Callback for logging to UI
+    public var onLog: ((String) -> Void)?
+    
+    var hubertModel: HubertModel?
+    var synthesizer: Synthesizer?
+    var rmvpe: RMVPE?
+    var crepe: CREPE?
+    var dspPitch: DSPPitchExtractor?
+    var indexManager: IndexManager?
+    var indexRate: Float = 0.75
+    var modelSampleRate: Int = 40000  // Detected from model config
+    
+    private func log(_ message: String) {
+        print(message) // Keep console output
+        DispatchQueue.main.async {
+            self.onLog?(message)
         }
     }
+    
+    public init() {
+        log("RVCInference: Initializing...")
+        #if targetEnvironment(simulator)
+        MLX.Device.setDefault(device: Device.cpu)
+        log("RVCInference: Running on Simulator, forced CPU device.")
+        #endif
+    }
+
+    /// Unload all models to free memory
+    public func unloadModels() {
+        log("RVCInference: Unloading models...")
+        hubertModel = nil
+        synthesizer = nil
+        rmvpe = nil
+        crepe = nil
+        dspPitch = nil
+        indexManager?.unload()
+        indexManager = nil
+        status = "Idle"
+        log("RVCInference: Models unloaded.")
+    }
+
+    /// Load index vectors for speaker embedding retrieval.
+    public func loadIndex(url: URL, rate: Float = 0.75) throws {
+        log("RVCInference: Loading index from \(url.lastPathComponent)")
+        let manager = IndexManager()
+        
+        try manager.load(url: url, logger: { [weak self] msg in
+            self?.log(msg)
+        })
+        
+        self.indexManager = manager
+        self.indexRate = rate
+        log("RVCInference: Index loaded with \(manager.count) vectors, rate=\(rate)")
+    }
+
+    /// Unload the index to free memory.
+    public func unloadIndex() {
+        indexManager?.unload()
+        indexManager = nil
+        log("RVCInference: Index unloaded.")
+    }
+
+    public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
+        DispatchQueue.main.async { self.status = "Loading models..." }
+        
+        // 1. Load Hubert
+        log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
+        var actualHubertURL = hubertURL
+        let hExt = hubertURL.pathExtension.lowercased()
+        if hExt == "pt" || hExt == "pth" {
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dest = docs.appendingPathComponent("hubert_base.safetensors")
+            if FileManager.default.fileExists(atPath: dest.path) {
+                actualHubertURL = dest
+            } else if let arrays = try? PthConverter.shared.convert(url: hubertURL) {
+                try? MLX.save(arrays: arrays, url: dest)
+                actualHubertURL = dest
+            }
+        }
+        
+        let hubertWeights = try MLX.loadArrays(url: actualHubertURL)
+        log("RVCInference: Raw HuBERT file keys count: \(hubertWeights.count), sample keys: \(Array(hubertWeights.keys.prefix(10)))")
+
+        self.hubertModel = HubertModel(config: HubertConfig())
+        var newParams: [String: MLXArray] = [:]
+        for (k, v) in hubertWeights {
+            var newKey = k
+            var val = v
+            
+            // Repeatedly strip "model." or "hubert." prefix
+            while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
+                if newKey.hasPrefix("model.") {
+                    newKey = String(newKey.dropFirst(6))
+                } else if newKey.hasPrefix("hubert.") {
+                    newKey = String(newKey.dropFirst(7))
+                }
+            }
+
+            // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
+            if newKey.hasPrefix("encoder.layers.") {
+                let parts = newKey.components(separatedBy: ".")
+                if parts.count >= 3, let idx = Int(parts[2]) {
+                    newKey = "encoder.l\(idx)." + parts.dropFirst(3).joined(separator: ".")
+                }
+            }
+            
+            // Remap feature_extractor.conv_layers.X.Y to feature_extractor.lX.conv/layer_norm
+            if newKey.hasPrefix("feature_extractor.conv_layers.") {
+                let parts = newKey.components(separatedBy: ".")
+                if parts.count >= 3, let idx = Int(parts[2]) {
+                    let subPath = parts.dropFirst(3).joined(separator: ".")
+                    if subPath == "0.weight" {
+                        newKey = "feature_extractor.l\(idx).conv.weight"
+                    } else if subPath == "0.bias" {
+                        newKey = "feature_extractor.l\(idx).conv.bias"
+                    } else if subPath == "2.weight" || subPath == "1.weight" {
+                        newKey = "feature_extractor.l\(idx).layer_norm.weight"
+                    } else if subPath == "2.bias" || subPath == "1.bias" {
+                        newKey = "feature_extractor.l\(idx).layer_norm.bias"
+                    } else {
+                        newKey = "feature_extractor.l\(idx)." + subPath
+                    }
+                }
+            }
+
+            // Fix Conv1d weight shape:
+            // PyTorch layout: [Out, In, K] (e.g. [512, 1, 10] or [512, 512, 2])
+            // MLX layout:     [Out, K, In] (e.g. [512, 10, 1] or [512, 2, 512])
+            // 【修正箇所】条件判定を外し、feature_extractor の Conv1d 3次元重みは無条件で [0, 2, 1] に転置する
+            if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
+                val = val.transposed(axes: [0, 2, 1])
+                log("RVCInference: Transposed \(newKey) to MLX Conv1d layout: \(val.shape)")
+            }
+            
+            newParams[newKey] = val
+        }
+        
+        // Fix HuBERT PosConv Weight Norm
+        let gKey = "encoder.pos_conv_embed.conv.weight_g"
+        let vKey = "encoder.pos_conv_embed.conv.weight_v"
+        let outKey = "encoder.pos_conv_embed.conv.weight"
+        
+        if let weight_g_raw = newParams[gKey], let weight_v_raw = newParams[vKey] {
+             let weight_v: MLXArray
+             let weight_g: MLXArray
+             if weight_v_raw.shape[1] < weight_v_raw.shape[2] {
+                 weight_v = weight_v_raw.transposed(axes: [0, 2, 1])
+                 weight_g = weight_g_raw.transposed(axes: [0, 2, 1])
+             } else {
+                 weight_v = weight_v_raw
+                 weight_g = weight_g_raw
+             }
+             
+             let v_sqr = weight_v * weight_v
+             let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true)
+             let v_norm = sqrt(v_sum + 1e-12)
+             let weight_normalized = weight_v / v_norm
+             
+             let weight_fused = weight_g * weight_normalized
+             
+             newParams[outKey] = weight_fused
+             newParams.removeValue(forKey: gKey)
+             newParams.removeValue(forKey: vKey)
+             log("RVCInference: Fused HuBERT PosConv weights (transposed, dim=2)")
+        }
+        log("RVCInference: Loaded \(newParams.count) HuBERT weights")
+        log("RVCInference: HuBERT sample keys: \(Array(newParams.keys.prefix(5)))")
+        
+        do {
+            self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
+            log("RVCInference: HuBERT parameters successfully updated.")
+        } catch {
+            log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
+        }
+        
+        // 2. Load Synthesizer (TextEncoder + Flow + Generator)
+        log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
+        let modelWeights = try MLX.loadArrays(url: modelURL)
+
+        log("RVCInference: Loaded \(modelWeights.count) weights (already in MLX format)")
+
+        let decKeys = modelWeights.keys.filter { $0.hasPrefix("dec.") }.sorted()
+        log("RVCInference: Generator weight keys: \(decKeys.prefix(20))...")
+
+        var detectedSR = self.modelSampleRate
+        var detectedUpsRates = [10, 10, 2, 2]
+        var detectedKernelSizes = [16, 16, 4, 4]
+
+        let configURL = modelURL.deletingPathExtension().appendingPathExtension("json")
+        if FileManager.default.fileExists(atPath: configURL.path) {
+            log("RVCInference: Found config at \(configURL.lastPathComponent)")
+            if let data = try? Data(contentsOf: configURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                if json.count > 17, let sr = json[17] as? Int {
+                    detectedSR = sr
+                    log("RVCInference: Detected Sample Rate \(detectedSR)Hz")
+                }
+                if json.count > 12, let uArr = json[12] as? [Any] {
+                    let u = uArr.compactMap { $0 as? Int }
+                    if !u.isEmpty {
+                        detectedUpsRates = u
+                        log("RVCInference: Detected Upsample Rates \(detectedUpsRates)")
+                    }
+                }
+                if json.count > 14, let kArr = json[14] as? [Any] {
+                    let k = kArr.compactMap { $0 as? Int }
+                    if !k.isEmpty {
+                        detectedKernelSizes = k
+                        log("RVCInference: Detected Kernel Sizes \(detectedKernelSizes)")
+                    }
+                }
+            }
+        } else {
+            log("RVCInference: No config JSON found, detecting from weights...")
+        }
+
+        for i in 0..<4 {
+            let upKey = "dec.up_\(i).weight"
+            if let upWeight = modelWeights[upKey] {
+                let detectedK = upWeight.shape[1]
+                if detectedK != detectedKernelSizes[i] {
+                    log("RVCInference: ⚠️ Kernel mismatch for up_\(i): config=\(detectedKernelSizes[i]), weight=\(detectedK). Using weight value.")
+                    detectedKernelSizes[i] = detectedK
+
+                    if i < 2 {
+                        let inferredStride: Int
+                        switch detectedK {
+                        case 24: inferredStride = 12
+                        case 20: inferredStride = 10
+                        case 16: inferredStride = 10
+                        default: inferredStride = detectedUpsRates[i]
+                        }
+                        if inferredStride != detectedUpsRates[i] {
+                            log("RVCInference: ⚠️ Inferring stride for up_\(i) from kernel=\(detectedK): stride=\(inferredStride)")
+                            detectedUpsRates[i] = inferredStride
+                        }
+                    }
+                }
+            }
+        }
+        log("RVCInference: Final architecture - upsampleRates=\(detectedUpsRates), kernelSizes=\(detectedKernelSizes), sampleRate=\(detectedSR)")
+
+        self.synthesizer = Synthesizer(
+            interChannels: 192,
+            hiddenChannels: 192,
+            filterChannels: 768,
+            nHeads: 2,
+            nLayers: 6,
+            kernelSize: 3,
+            pDropout: 0.0,
+            embeddingDim: 768,
+            speakerEmbedDim: 256,
+            ginChannels: 256,
+            useF0: true,
+            upsampleRates: detectedUpsRates,
+            upsampleKernelSizes: detectedKernelSizes,
+            sampleRate: detectedSR
+        )
+        
+        self.modelSampleRate = detectedSR
+        
+        func needsConvInsertion(_ key: String) -> Bool {
+            if key.hasPrefix("dec.conv_pre.") || key.hasPrefix("dec.conv_post.") { return true }
+            if key.contains("dec.noise_conv_") { return true }
+            if key.contains("dec.resblock_") && (key.contains(".c1_") || key.contains(".c2_")) { return true }
+            return false
+        }
+
+        func isConvTransposeWeight(_ key: String) -> Bool {
+            let isUpWeight = (key.contains("dec.up_") || key.contains("dec.ups.")) && key.hasSuffix(".weight")
+            return isUpWeight
+        }
+
+        var synthParams: [String: MLXArray] = [:]
+        for (k, v) in modelWeights {
+            var newK = k
+            var newV = v
+
+            if newK.contains("dec.ups.") {
+                newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_")
+            }
+            if newK.contains("dec.noise_convs.") {
+                newK = newK.replacingOccurrences(of: "dec.noise_convs.", with: "dec.noise_conv_")
+            }
+            if newK.contains("dec.resblocks.") {
+                newK = newK.replacingOccurrences(of: "dec.resblocks.", with: "dec.resblock_")
+                newK = newK.replacingOccurrences(of: ".convs1.", with: ".c1_")
+                newK = newK.replacingOccurrences(of: ".convs2.", with: ".c2_")
+            }
+
+            if newK.contains("dec.resblock_") && (newK.contains(".c1_") || newK.contains(".c2_")) {
+                let oldKey = newK
+                if newK.hasSuffix(".weight") && !newK.contains(".conv.") {
+                    newK = newK.replacingOccurrences(of: ".weight", with: ".conv.weight")
+                    if oldKey.contains("c1_0") && oldKey.contains("resblock_0") {
+                        log("DEBUG: Remapped resblock key: \(oldKey) -> \(newK)")
+                    }
+                }
+                if newK.hasSuffix(".bias") && !newK.contains(".conv.") {
+                    newK = newK.replacingOccurrences(of: ".bias", with: ".conv.bias")
+                }
+            }
+
+            if newK.contains("enc_p.encoder.") {
+                for i in 0..<6 {
+                    newK = newK.replacingOccurrences(of: "encoder.attn_\(i).", with: "encoder.attn_layers.\(i).")
+                    newK = newK.replacingOccurrences(of: "encoder.norm1_\(i).", with: "encoder.norm_layers_1.\(i).")
+                    newK = newK.replacingOccurrences(of: "encoder.ffn_\(i).", with: "encoder.ffn_layers.\(i).")
+                    newK = newK.replacingOccurrences(of: "encoder.norm2_\(i).", with: "encoder.norm_layers_2.\(i).")
+                }
+            }
+
+            if needsConvInsertion(newK) && !newK.contains(".conv.") {
+                if newK.hasSuffix(".weight") {
+                    newK = String(newK.dropLast(7)) + ".conv.weight"
+                } else if newK.hasSuffix(".bias") {
+                    newK = String(newK.dropLast(5)) + ".conv.bias"
+                }
+            }
+
+            if newK.contains("enc_p.emb_pitch") {
+                log("DEBUG: check - Found Pitch Embedding Key: \(newK)")
+            }
+            
+            synthParams[newK] = newV
+        }
+
+        log("RVCInference: About to load \(synthParams.count) parameters into Synthesizer")
+
+        let resblockKeys = synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted()
+        log("DEBUG: Resblock_0.c1_0 keys after remapping: \(resblockKeys)")
+
+        let nsfKeys = synthParams.keys.filter { $0.contains("m_source") }.sorted()
+        log("DEBUG: All m_source (NSF) keys in model: \(nsfKeys)")
+
+        for i in 0..<4 {
+            let gKey = "dec.up_\(i).weight_g"
+            let vKey = "dec.up_\(i).weight_v"
+            let outKey = "dec.up_\(i).weight"
+            
+            if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
+                let v_sqr = weight_v * weight_v
+                let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
+                let v_norm = sqrt(v_sum + 1e-12)
+                
+                let weight_normalized = weight_v / v_norm
+                let weight_fused = weight_g * weight_normalized
+                
+                synthParams[outKey] = weight_fused
+                log("RVCInference: Fused weight_g \(weight_g.shape) + weight_v \(weight_v.shape) -> \(outKey) \(weight_fused.shape)")
+                
+                synthParams.removeValue(forKey: gKey)
+                synthParams.removeValue(forKey: vKey)
+            }
+        }
+        
+        for i in 0..<12 {
+            for (convPrefix, convCount) in [("c1_", 3), ("c2_", 3)] {
+                for j in 0..<convCount {
+                    let base = "dec.resblock_\(i).\(convPrefix)\(j)"
+                    let gKey = "\(base).weight_g"
+                    let vKey = "\(base).weight_v"
+                    let outKey = "\(base).conv.weight"
+                    
+                    if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
+                        let v_sqr = weight_v * weight_v
+                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
+                        let v_norm = sqrt(v_sum + 1e-12)
+                        
+                        let weight_normalized = weight_v / v_norm
+                        let weight_fused = weight_g * weight_normalized
+                        
+                        synthParams[outKey] = weight_fused
+                        synthParams.removeValue(forKey: gKey)
+                        synthParams.removeValue(forKey: vKey)
+                    }
+                }
+            }
+        }
+        
+        log("RVCInference: After weight fusion: \(synthParams.count) parameters")
+        log("RVCInference: Generator up_0 weight shape in file: \(synthParams["dec.up_0.weight"]?.shape ?? [])")
+
+        if let embPhoneWeight = synthParams["enc_p.emb_phone.weight"] {
+            MLX.eval(embPhoneWeight)
+            log("DEBUG: synthParams[enc_p.emb_phone.weight] BEFORE update: shape=\(embPhoneWeight.shape), range=[\(embPhoneWeight.min().item(Float.self))...\(embPhoneWeight.max().item(Float.self))]")
+        } else {
+            log("DEBUG: synthParams[enc_p.emb_phone.weight] NOT FOUND!")
+        }
+
+        if let nsfWeight = synthParams["dec.m_source.l_linear.weight"] {
+            MLX.eval(nsfWeight)
+            log("DEBUG: synthParams[dec.m_source.l_linear.weight] BEFORE update: shape=\(nsfWeight.shape), range=[\(nsfWeight.min().item(Float.self))...\(nsfWeight.max().item(Float.self))]")
+        } else {
+            log("DEBUG: synthParams[dec.m_source.l_linear.weight] NOT FOUND - NSF will use init weights!")
+        }
+        if let nsfBias = synthParams["dec.m_source.l_linear.bias"] {
+            MLX.eval(nsfBias)
+            log("DEBUG: synthParams[dec.m_source.l_linear.bias] BEFORE update: shape=\(nsfBias.shape), value=\(nsfBias.asArray(Float.self))")
+        } else {
+            log("DEBUG: synthParams[dec.m_source.l_linear.bias] NOT FOUND - NSF will use init bias!")
+        }
+
+        do {
+            self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
+            self.synthesizer?.train(false)
+            log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
+        } catch {
+            log("RVCInference: ⚠️ Error updating Synthesizer parameters: \(error)")
+        }
+
+        if let synth = self.synthesizer {
+            let emb_phone = synth.enc_p.emb_phone.weight
+            log("DEBUG: enc_p.emb_phone.weight: shape=\(emb_phone.shape), range=[\(emb_phone.min().item(Float.self))...\(emb_phone.max().item(Float.self))]")
+            if let emb_pitch = synth.enc_p.emb_pitch {
+                let w = emb_pitch.weight
+                log("DEBUG: enc_p.emb_pitch.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
+            }
+
+            let w0 = synth.dec.resblock_0.c1_0.conv.weight
+            MLX.eval(w0)
+            log("DEBUG: resblock_0.c1_0.conv.weight (kernel=3): shape=\(w0.shape), range=[\(w0.min().item(Float.self))...\(w0.max().item(Float.self))], mean=\(w0.mean().item(Float.self))")
+            log("DEBUG: EXPECTED from Drake.safetensors: shape=(256, 3, 256), range=[-0.44, 0.66], mean=-0.0013")
+
+            if let fileW0 = synthParams["dec.resblock_0.c1_0.conv.weight"] {
+                MLX.eval(fileW0)
+                log("DEBUG: synthParams key found! File weight range=[\(fileW0.min().item(Float.self))...\(fileW0.max().item(Float.self))]")
+            } else {
+                log("DEBUG: WARNING - synthParams[dec.resblock_0.c1_0.conv.weight] NOT FOUND! Weights may not be loading correctly!")
+                log("DEBUG: Available dec.resblock_0 keys: \(synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted())")
+            }
+
+            let flowCondW = synth.flow.flow_0.enc.cond_layer?.weight
+            if let w = flowCondW {
+                log("DEBUG: flow.flow_0.enc.cond_layer.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
+            } else {
+                log("DEBUG: flow.flow_0.enc.cond_layer is nil!")
+            }
+            let flowIn0W = synth.flow.flow_0.enc.in_layer_0.weight
+            log("DEBUG: flow.flow_0.enc.in_layer_0.weight: shape=\(flowIn0W.shape), range=[\(flowIn0W.min().item(Float.self))...\(flowIn0W.max().item(Float.self))]")
+
+            let nsfW = synth.dec.m_source.l_linear.weight
+            MLX.eval(nsfW)
+            log("DEBUG: dec.m_source.l_linear.weight AFTER load: shape=\(nsfW.shape), values=\(nsfW.asArray(Float.self))")
+            if let nsfB = synth.dec.m_source.l_linear.bias {
+                MLX.eval(nsfB)
+                log("DEBUG: dec.m_source.l_linear.bias AFTER load: shape=\(nsfB.shape), values=\(nsfB.asArray(Float.self))")
+            } else {
+                log("DEBUG: dec.m_source.l_linear.bias is nil (no bias)")
+            }
+        }
+        
+        // 3. Load RMVPE (Optional)
+        if let rmvpeURL = rmvpeURL {
+            do {
+                log("RVCInference: Loading RMVPE from \(rmvpeURL.lastPathComponent)")
+                let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
+                self.rmvpe = RMVPE()
+                
+                var remappedRMVPE: [String: MLXArray] = [:]
+                for (k, v) in rmvpeWeights {
+                    var newKey = k
+                    
+                    if newKey.contains("num_batches_tracked") {
+                        continue
+                    }
+                    
+                    if newKey.hasPrefix("fc.bigru.forward_grus.0.") {
+                        newKey = "bigru.fwd0." + String(newKey.dropFirst("fc.bigru.forward_grus.0.".count))
+                    }
+                    
+                    if newKey.hasPrefix("fc.bigru.backward_grus.0.") {
+                        newKey = "bigru.bwd0." + String(newKey.dropFirst("fc.bigru.backward_grus.0.".count))
+                    }
+                    
+                    if newKey.hasPrefix("fc.linear.") {
+                        newKey = "linear." + String(newKey.dropFirst("fc.linear.".count))
+                    }
+                    
+                    newKey = newKey.replacingOccurrences(of: ".blocks.0.", with: ".b0.")
+                    newKey = newKey.replacingOccurrences(of: ".blocks.1.", with: ".b1.")
+                    newKey = newKey.replacingOccurrences(of: ".blocks.2.", with: ".b2.")
+                    newKey = newKey.replacingOccurrences(of: ".blocks.3.", with: ".b3.")
+                    
+                    if newKey.contains(".layers.") {
+                        newKey = newKey.replacingOccurrences(of: ".layers.0.", with: ".l0.")
+                        newKey = newKey.replacingOccurrences(of: ".layers.1.", with: ".l1.")
+                        newKey = newKey.replacingOccurrences(of: ".layers.2.", with: ".l2.")
+                        newKey = newKey.replacingOccurrences(of: ".layers.3.", with: ".l3.")
+                        newKey = newKey.replacingOccurrences(of: ".layers.4.", with: ".l4.")
+                    }
+                    
+                    if newKey.contains("running_mean") {
+                        print("DEBUG: Remapping running_mean found: \(newKey)")
+                    }
+                    newKey = newKey.replacingOccurrences(of: ".running_mean", with: ".runningMean")
+                    newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
+                    
+                    if newKey.contains("runningMean") {
+                        print("DEBUG: Remapped to runningMean: \(newKey)")
+                    }
+
+                    var val = v
+                    if newKey.hasSuffix(".weight") && val.ndim == 4 {
+                        val = val.transposed(axes: [0, 2, 3, 1])
+                    }
+                    
+                    remappedRMVPE[newKey] = val
+                }
+                
+                log("RVCInference: RMVPE sample keys after remapping: \(Array(remappedRMVPE.keys.prefix(5)))")
+
+                let bnRunningKeys = remappedRMVPE.keys.filter { $0.contains("encoder.bn.running") }
+                log("RVCInference: BN running stat keys to load: \(bnRunningKeys)")
+                if let rmKey = remappedRMVPE["unet.encoder.bn.runningMean"] {
+                    log("RVCInference: encoder.bn.runningMean value: \(rmKey.asArray(Float.self))")
+                }
+                if let rvKey = remappedRMVPE["unet.encoder.bn.runningVar"] {
+                    log("RVCInference: encoder.bn.runningVar value: \(rvKey.asArray(Float.self))")
+                }
+
+                do {
+                    self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
+                    log("RVCInference: RMVPE parameters successfully updated.")
+                } catch {
+                    log("RVCInference: ⚠️ Error updating RMVPE parameters: \(error)")
+                }
+                self.rmvpe?.setTrainingMode(false)
+
+                log("RVCInference: ✅ RMVPE loaded with CustomBatchNorm (\(remappedRMVPE.count) keys)")
+            } catch {
+                log("RVCInference: Failed to load RMVPE: \(error). Using fallback F0.")
+                self.rmvpe = nil
+            }
+        } else {
+            log("RVCInference: No RMVPE URL provided. Using fallback F0.")
+        }
+
+        // 4. Load CREPE (Optional)
+        if let crepeURL = crepeURL {
+            do {
+                log("RVCInference: Loading CREPE from \(crepeURL.lastPathComponent)")
+                self.crepe = try CREPE(weightsURL: crepeURL, modelType: "full")
+                log("RVCInference: ✅ CREPE loaded successfully")
+            } catch {
+                log("RVCInference: Failed to load CREPE: \(error). CREPE will not be available.")
+                self.crepe = nil
+            }
+        } else {
+            log("RVCInference: No CREPE URL provided. CREPE will not be available.")
+        }
+
+        self.hubertModel?.train(false)
+        
+        DispatchQueue.main.async { self.status = "Models Loaded" }
+    }
+    
+    public func infer(
+        audioURL: URL,
+        outputURL: URL,
+        pitchShift: Int = 0,           // Semitones (-12 to +12)
+        f0Method: String = "rmvpe",    // F0 extraction method
+        indexRate: Float = 0.75,       // Feature retrieval blend
+        volumeEnvelope: Float = 1.0
+    ) async {
+        do {
+            DispatchQueue.main.async { self.status = "Loading Audio..." }
+            
+            let (audioArray, _) = try AudioProcessor.shared.loadAudio(url: audioURL)
+            
+            let totalSamples = audioArray.size
+            log("RVCInference: Processing \(totalSamples) samples (\(Float(totalSamples)/16000.0)s at 16kHz)")
+            
+            DispatchQueue.main.async { self.status = "Processing..." }
+            
+            let maxSamples = 16000 * 30
+            var audioToProcess = audioArray
+            if totalSamples > maxSamples {
+                log("RVCInference: Audio too long (\(totalSamples) samples), truncating to \(maxSamples)")
+                audioToProcess = audioArray[0..<maxSamples]
+            }
+            
+            audioToProcess = applyButterworthHighPass(audioToProcess)
+            
+            let padSamples = 1600
+            let audioPadded = padReflect(audioToProcess, padding: padSamples)
+            
+            let outputPadded = try await inferChunk(
+                chunk: audioPadded,
+                pitchShift: pitchShift,
+                f0Method: f0Method,
+                indexRate: indexRate
+            )
+            MLX.eval(outputPadded)
+            
+            let outputRatio: Float = Float(self.modelSampleRate) / 16000.0
+            let cropSamples = Int(Float(padSamples) * outputRatio)
+            
+            let outputLen = outputPadded.shape[1]
+            let coreStart = cropSamples
+            let coreEnd = outputLen - cropSamples
+            
+            var finalOutput: MLXArray
+            if coreEnd > coreStart {
+                finalOutput = outputPadded[0..., coreStart..<coreEnd, 0...].squeezed(axes: [0, 2])
+            } else {
+                finalOutput = outputPadded.squeezed(axes: [0, 2])
+            }
+            
+            MLX.eval(finalOutput)
+
+            if volumeEnvelope != 1.0 {
+                finalOutput = finalOutput * volumeEnvelope
+                MLX.eval(finalOutput)
+            }
+
+            let outputSampleRate: Double = Double(self.modelSampleRate)
+
+            log("RVCInference: Saving \(finalOutput.size) samples to \(outputURL.path)")
+            try AudioProcessor.shared.saveAudio(array: finalOutput, url: outputURL, sampleRate: outputSampleRate)
+            
+            log("RVCInference: Done!")
+            DispatchQueue.main.async { self.status = "Done!" }
+            
+        } catch {
+            log("RVCInference Error: \(error)")
+            DispatchQueue.main.async { self.status = "Error: \(error.localizedDescription)" }
+        }
+    }
+    
+    private func inferChunk(
+        chunk: MLXArray,
+        pitchShift: Int,
+        f0Method: String,
+        indexRate: Float
+    ) async throws -> MLXArray {
+        var cleanAudio = chunk
+        if cleanAudio.ndim == 2 {
+            cleanAudio = cleanAudio.mean(axis: 0)
+        }
+        if cleanAudio.ndim != 1 {
+            cleanAudio = cleanAudio.flattened()
+        }
+        
+        log("DEBUG: Audio input - shape: \(cleanAudio.shape), min: \(cleanAudio.min().item(Float.self)), max: \(cleanAudio.max().item(Float.self)), mean: \(cleanAudio.mean().item(Float.self))")
+        
+        let audioSlice = cleanAudio[0..<min(20, cleanAudio.shape[0])].asType(Float.self)
+        MLX.eval(audioSlice)
+        let audioSamples = audioSlice.asArray(Float.self)
+        log("DEBUG: Audio input (padded, filtered) first 20 samples: \(audioSamples)")
+         
+        let audioInput = cleanAudio.expandedDimensions(axis: 0)
+        guard let hubertModel = hubertModel else {
+            throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded. Please ensure hubert_base.safetensors exists in Documents."])
+        }
+        let hubertFeatures: MLXArray = autoreleasepool {
+            let feat = hubertModel(audioInput)
+            MLX.eval(feat)
+            return feat
+        }
+        GPU.clearCache()
+        log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
+        
+        autoreleasepool {
+            let hubertSlice = hubertFeatures[0, 0, 0..<5].asType(Float.self)
+            MLX.eval(hubertSlice)
+            let hubertSamples = hubertSlice.asArray(Float.self)
+            log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
+        }
+
+        var f0: MLXArray
+        switch f0Method.lowercased() {
+        case "crepe", "crepe-full":
+            if let crepe = crepe {
+                f0 = crepe.getF0(audio: cleanAudio, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
+                log("DEBUG: CREPE F0 shape: \(f0.shape)")
+            } else if let rmvpe = rmvpe {
+                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
+            } else {
+                let frames = hubertFeatures.shape[1] * 2
+                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
+            }
+
+        case "rmvpe":
+            if let rmvpe = rmvpe {
+                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
+            } else {
+                log("WARN: RMVPE not loaded, using fallback F0")
+                let frames = hubertFeatures.shape[1] * 2
+                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
+            }
+
+        default:
+            if let rmvpe = rmvpe {
+                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
+            } else {
+                let frames = hubertFeatures.shape[1] * 2
+                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
+            }
+        }
+        MLX.eval(f0)
+        GPU.clearCache()
+        
+        let N = hubertFeatures.shape[0]
+        let L = hubertFeatures.shape[1]
+        let C = hubertFeatures.shape[2]
+        
+        let expanded = hubertFeatures.expandedDimensions(axis: 2)
+        let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
+        var phone = broadcasted.reshaped([N, L * 2, C])
+        
+        let phoneLen = phone.shape[1]
+        let f0Len = f0.shape[1]
+        let minLen = min(phoneLen, f0Len)
+        
+        if phoneLen != minLen {
+            phone = phone[0..., 0..<minLen, 0...]
+        }
+        if f0Len != minLen {
+            f0 = f0[0..., 0..<minLen, 0...]
+        }
+        log("DEBUG: Aligned phone shape: \(phone.shape), f0 shape: \(f0.shape)")
+
+        if indexRate > 0, let indexManager = indexManager {
+            phone = indexManager.search(features: phone, indexRate: indexRate)
+            log("DEBUG: FAISS Index retrieval completed with rate \(indexRate)")
+        }
+
+        guard let synth = synthesizer else {
+            throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded in Synthesizer"])
+        }
+
+        var f0Hz = f0.squeezed(axes: [2])
+        if pitchShift != 0 {
+            let multiplier = pow(2.0, Float(pitchShift) / 12.0)
+            f0Hz = f0Hz * multiplier
+        }
+        let f0_min: Float = 50.0
+        let f0_max: Float = 1100.0
+        let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
+        let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
+        let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
+        var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
+        pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
+        pitch = MLX.maximum(pitch, 1.0)
+        pitch = MLX.minimum(pitch, 255.0)
+        let pitchBuckets = pitch.asType(Int32.self)
+        
+        let nsff0 = f0Hz.expandedDimensions(axis: 2)
+        let phoneLengths = MLXArray([Int32(minLen)])
+        let sid = MLXArray([Int32(0)])
+
+        let audioConverted: MLXArray = try autoreleasepool {
+            let out = synth.infer(
+                phone: phone,
+                phoneLengths: phoneLengths,
+                pitch: pitchBuckets,
+                nsff0: nsff0,
+                sid: sid
+            )
+            MLX.eval(out)
+            return out
+        }
+        GPU.clearCache()
+
+        return audioConverted
+    }
+
+    public func runBenchmark(audioURL: URL, referenceURL: URL?, outputURL: URL) async throws -> String {
+        await infer(audioURL: audioURL, outputURL: outputURL)
+
+        guard let refURL = referenceURL else {
+            return "Inference completed. No reference provided for comparison."
+        }
+
+        #if os(macOS)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        task.arguments = [
+            "tools/compare_wavs.py",
+            refURL.path,
+            outputURL.path
+        ]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        try task.run()
+        task.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else {
+            return "Failed to read comparison output"
+        }
+
+        return output
+        #else
+        return "Inference completed. Reference comparison not available on iOS (reference: \(refURL.lastPathComponent))."
+        #endif
+    }
+    
+    private func applyButterworthHighPass(_ audio: MLXArray) -> MLXArray {
+        let b: [Double] = [0.9699606451838447, -4.849803225919223, 9.699606451838447, -9.699606451838447, 4.849803225919223, -0.9699606451838447]
+        let a: [Double] = [1.0, -4.939001819168364, 9.757863526739543, -9.639544849413458, 4.761506797356209, -0.9408236532054606]
+        
+        MLX.eval(audio)
+        let samplesFloat = audio.asArray(Float.self)
+        let samples = samplesFloat.map { Double($0) }
+        
+        func filter(_ x: [Double]) -> [Double] {
+            var y = [Double](repeating: 0, count: x.count)
+            for n in 0..<x.count {
+                var val = b[0] * x[n]
+                if n > 0 { val += b[1] * x[n-1] }
+                if n > 1 { val += b[2] * x[n-2] }
+                if n > 2 { val += b[3] * x[n-3] }
+                if n > 3 { val += b[4] * x[n-4] }
+                if n > 4 { val += b[5] * x[n-5] }
+                
+                if n > 0 { val -= a[1] * y[n-1] }
+                if n > 1 { val -= a[2] * y[n-2] }
+                if n > 2 { val -= a[3] * y[n-3] }
+                if n > 3 { val -= a[4] * y[n-4] }
+                if n > 4 { val -= a[5] * y[n-5] }
+                
+                y[n] = val
+            }
+            return y
+        }
+        
+        let y_fwd = filter(samples)
+        let y_rev = Array(y_fwd.reversed())
+        let y_back = filter(y_rev)
+        let y_final = Array(y_back.reversed())
+        
+        let resultFloat = y_final.map { Float($0) }
+        return MLXArray(resultFloat)
+    }
+    
+    private func padReflect(_ audio: MLXArray, padding: Int) -> MLXArray {
+        MLX.eval(audio)
+        let samples = audio.asArray(Float.self)
+        let n = samples.count
+        
+        guard n > 1 else { return audio }
+        
+        var leftPad: [Float] = []
+        if padding > 0 {
+            let start = 1
+            let end = min(padding, n - 1)
+            if end >= start {
+                leftPad = Array(samples[start...end].reversed())
+            }
+        }
+        
+        var rightPad: [Float] = []
+        if padding > 0 {
+            let start = max(0, n - 1 - padding)
+            let end = n - 2
+            if end >= start {
+                rightPad = Array(samples[start...end].reversed())
+            }
+        }
+        
+        let result = leftPad + samples + rightPad
+        return MLXArray(result)
+    }
+}
