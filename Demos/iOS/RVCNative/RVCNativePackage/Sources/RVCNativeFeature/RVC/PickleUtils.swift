@@ -420,3 +420,66 @@ struct TensorStorage {
          }
     }
 }
+
+/// Dynamic safe casting utility functions to gracefully handle any unexpected types in PyTorch/Pickle parsing.
+public struct SafeCast {
+    public static func toFloat(_ value: Any?, default defaultValue: Float = 0.0) -> Float {
+        guard let value = value else { return defaultValue }
+        if let f = value as? Float { return f }
+        if let d = value as? Double { return Float(d) }
+        if let i = value as? Int { return Float(i) }
+        if let i64 = value as? Int64 { return Float(i64) }
+        if let str = value as? String, let f = Float(str) { return f }
+        if let n = value as? NSNumber { return n.floatValue }
+        return defaultValue
+    }
+    
+    public static func toInt(_ value: Any?, default defaultValue: Int = 0) -> Int {
+        guard let value = value else { return defaultValue }
+        if let i = value as? Int { return i }
+        if let i64 = value as? Int64 { return Int(i64) }
+        if let f = value as? Float { return Int(f) }
+        if let d = value as? Double { return Int(d) }
+        if let str = value as? String, let i = Int(str) { return i }
+        if let n = value as? NSNumber { return n.intValue }
+        return defaultValue
+    }
+    
+    public static func toString(_ value: Any?, default defaultValue: String = "") -> String {
+        guard let value = value else { return defaultValue }
+        if let str = value as? String { return str }
+        return String(describing: value)
+    }
+    
+    public static func toBool(_ value: Any?, default defaultValue: Bool = false) -> Bool {
+        guard let value = value else { return defaultValue }
+        if let b = value as? Bool { return b }
+        if let i = value as? Int { return i != 0 }
+        if let n = value as? NSNumber { return n.boolValue }
+        if let str = value as? String {
+            let lower = str.lowercased()
+            if lower == "true" || lower == "1" || lower == "yes" { return true }
+            if lower == "false" || lower == "0" || lower == "no" { return false }
+        }
+        return defaultValue
+    }
+
+    public static func toArray(_ value: Any?) -> [Any] {
+        guard let value = value else { return [] }
+        if let arr = value as? [Any] { return arr }
+        return [value]
+    }
+
+    public static func toDict(_ value: Any?) -> [String: Any] {
+        guard let value = value else { return [:] }
+        if let dict = value as? [String: Any] { return dict }
+        if let dict = value as? [AnyHashable: Any] {
+            var result: [String: Any] = [:]
+            for (k, v) in dict {
+                result[String(describing: k)] = v
+            }
+            return result
+        }
+        return [:]
+    }
+}

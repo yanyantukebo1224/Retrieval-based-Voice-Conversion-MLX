@@ -8,9 +8,31 @@ class ConsoleLogRedirector: ObservableObject {
     private let pipe = Pipe()
     private var originalStdout: Int32 = -1
     private var originalStderr: Int32 = -1
+    private var logFileHandle: FileHandle?
     
     private init() {
+        setupLogDirectoryAndFile()
         setupRedirect()
+    }
+    
+    private func setupLogDirectoryAndFile() {
+        let fileManager = FileManager.default
+        guard let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let logsDir = docsDir.appendingPathComponent("logs", isDirectory: true)
+        
+        do {
+            if !fileManager.fileExists(atPath: logsDir.path) {
+                try fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true, attributes: nil)
+            }
+            let logFileURL = logsDir.appendingPathComponent("rvc_app.log")
+            if !fileManager.fileExists(atPath: logFileURL.path) {
+                fileManager.createFile(atPath: logFileURL.path, contents: nil, attributes: nil)
+            }
+            logFileHandle = try FileHandle(forWritingTo: logFileURL)
+            logFileHandle?.seekToEndOfFile()
+        } catch {
+            print("Failed to initialize logs directory/file: \(error)")
+        }
     }
     
     func setupRedirect() {
@@ -33,7 +55,12 @@ class ConsoleLogRedirector: ObservableObject {
                 }
             }
             
-            // 2. Update the in-app log buffer
+            // 2. Write to logs/rvc_app.log file
+            if let handle = self?.logFileHandle {
+                try? handle.write(contentsOf: data)
+            }
+            
+            // 3. Update the in-app log buffer
             if let str = String(data: data, encoding: .utf8) {
                 DispatchQueue.main.async {
                     self?.logs += str
@@ -51,5 +78,9 @@ class ConsoleLogRedirector: ObservableObject {
         DispatchQueue.main.async {
             self.logs = ""
         }
+    }
+    
+    deinit {
+        logFileHandle?.closeFile()
     }
 }

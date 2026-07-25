@@ -159,14 +159,26 @@ struct ContentView: View {
             switch importType {
             case .model:
                 DocumentPicker(
-                    contentTypes: [UTType(filenameExtension: "safetensors")!, UTType(filenameExtension: "npz")!, UTType(filenameExtension: "pth")!, UTType.zip]
+                    contentTypes: [
+                        .item, .data, .content, .archive, .zip,
+                        UTType(filenameExtension: "safetensors") ?? .data,
+                        UTType(filenameExtension: "npz") ?? .data,
+                        UTType(filenameExtension: "pth") ?? .data,
+                        UTType(filenameExtension: "index") ?? .data
+                    ]
                 ) { url in
                     activeImport = nil
                     handleFileImportURL(url: url)
                 }
             case .audio:
                 DocumentPicker(
-                    contentTypes: [UTType.mp3, UTType.wav]
+                    contentTypes: [
+                        .audio, .data, .item, .content, .mp3, .wav,
+                        UTType(filenameExtension: "m4a") ?? .audio,
+                        UTType(filenameExtension: "flac") ?? .audio,
+                        UTType(filenameExtension: "aac") ?? .audio,
+                        UTType(filenameExtension: "ogg") ?? .audio
+                    ]
                 ) { url in
                     activeImport = nil
                     handleAudioFileImportURL(url: url)

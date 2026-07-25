@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// UIKit document picker wrapped for SwiftUI usage.
+/// UIKit document picker wrapped for SwiftUI usage with security scope & Japanese filename handling.
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
     let onPick: (URL) -> Void
@@ -29,7 +29,30 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
-            onPick(url)
+            
+            let isAccessing = url.startAccessingSecurityScopedResource()
+            defer {
+                if isAccessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            
+            let fileManager = FileManager.default
+            let tempDir = fileManager.temporaryDirectory
+            // URLデコードした適切な日本語ファイル名を保持
+            let fileName = url.lastPathComponent.removingPercentEncoding ?? url.lastPathComponent
+            let destURL = tempDir.appendingPathComponent(fileName)
+            
+            do {
+                if fileManager.fileExists(atPath: destURL.path) {
+                    try fileManager.removeItem(at: destURL)
+                }
+                try fileManager.copyItem(at: url, to: destURL)
+                onPick(destURL)
+            } catch {
+                print("Failed to copy picked file to temp directory: \(error)")
+                onPick(url)
+            }
         }
     }
 }
