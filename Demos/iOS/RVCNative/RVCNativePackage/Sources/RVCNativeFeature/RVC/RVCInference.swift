@@ -106,9 +106,11 @@ import MLXNN
             for (k, v) in hubertWeights {
                 var newKey = k
                 var val = v
-                // Strip "model." prefix if present in HF / PyTorch safetensors
+                // Strip "model." or "hubert." prefix if present in HF / PyTorch / RVC safetensors
                 if newKey.hasPrefix("model.") {
                     newKey = String(newKey.dropFirst(6))
+                } else if newKey.hasPrefix("hubert.") {
+                    newKey = String(newKey.dropFirst(7))
                 }
 
                 // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
@@ -575,8 +577,14 @@ import MLXNN
                         if newKey.contains("runningMean") {
                             print("DEBUG: Remapped to runningMean: \(newKey)")
                         }
+
+                        // Fix RMVPE 4D Conv2d weight layout: PyTorch [Out, In, H, W] -> MLX [Out, H, W, In]
+                        var val = v
+                        if newKey.hasSuffix(".weight") && val.ndim == 4 {
+                            val = val.transposed(axes: [0, 2, 3, 1])
+                        }
                         
-                        remappedRMVPE[newKey] = v
+                        remappedRMVPE[newKey] = val
                     }
                     
                     log("RVCInference: RMVPE sample keys after remapping: \(Array(remappedRMVPE.keys.prefix(5)))")
