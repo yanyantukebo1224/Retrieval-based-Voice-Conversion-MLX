@@ -134,9 +134,17 @@ import MLXNN
                     }
                 }
 
-                // Fix Conv1d weight shape: PyTorch [Out, In, K] -> MLX [Out, K, In]
+                // Fix Conv1d weight shape:
+                // PyTorch layout: [Out, In, K] (e.g. [512, 1, 10] or [512, 512, 2])
+                // MLX layout:     [Out, K, In] (e.g. [512, 10, 1] or [512, 2, 512])
                 if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
-                    val = val.transposed(axes: [0, 2, 1])
+                    let dim1 = val.shape[1]
+                    let dim2 = val.shape[2]
+                    // If dim2 is smaller (e.g. kernelSize 10, 3, 2) than dim1 (inChannels 512), it's PyTorch [Out, In, K]
+                    if dim2 < dim1 || (dim2 <= 10 && dim1 >= 512) {
+                        val = val.transposed(axes: [0, 2, 1])
+                        log("RVCInference: Transposed \(newKey) from PyTorch to MLX Conv1d layout: \(val.shape)")
+                    }
                 }
                 
                 newParams[newKey] = val
@@ -149,11 +157,16 @@ import MLXNN
             
             if let weight_g_raw = newParams[gKey], let weight_v_raw = newParams[vKey] {
                  // PyTorch weight_v: (Out, In/Groups, Kernel) e.g. (768, 48, 128)
-                 // PyTorch weight_g: (1, 1, Kernel) e.g. (1, 1, 128) [Weight Norm dim=2]
-                 
-                 // Structurally transpose to MLX Conv1d layout (Out, Kernel, In/Groups)
-                 let weight_v = weight_v_raw.transposed(axes: [0, 2, 1]) // (768, 128, 48)
-                 let weight_g = weight_g_raw.transposed(axes: [0, 2, 1]) // (1, 128, 1)
+                 // MLX weight_v:     (Out, Kernel, In/Groups) e.g. (768, 128, 48)
+                 let weight_v: MLXArray
+                 let weight_g: MLXArray
+                 if weight_v_raw.shape[1] < weight_v_raw.shape[2] {
+                     weight_v = weight_v_raw.transposed(axes: [0, 2, 1]) // (768, 128, 48)
+                     weight_g = weight_g_raw.transposed(axes: [0, 2, 1]) // (1, 128, 1)
+                 } else {
+                     weight_v = weight_v_raw
+                     weight_g = weight_g_raw
+                 }
                  
                  // Norm calculation (PyTorch dim=2 -> MLX axes [0, 2])
                  let v_sqr = weight_v * weight_v
