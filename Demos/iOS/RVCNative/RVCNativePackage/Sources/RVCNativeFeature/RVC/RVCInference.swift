@@ -8,7 +8,6 @@ public class RVCInference: ObservableObject {
     public static let bundle = Bundle.module
     @Published public var status: String = "Idle"
     
-    // Callback for logging to UI
     public var onLog: ((String) -> Void)?
     
     var hubertModel: HubertModel?
@@ -18,10 +17,10 @@ public class RVCInference: ObservableObject {
     var dspPitch: DSPPitchExtractor?
     var indexManager: IndexManager?
     var indexRate: Float = 0.75
-    var modelSampleRate: Int = 40000  // Detected from model config
+    var modelSampleRate: Int = 40000
     
     private func log(_ message: String) {
-        print(message) // Keep console output
+        print(message)
         DispatchQueue.main.async {
             self.onLog?(message)
         }
@@ -35,7 +34,6 @@ public class RVCInference: ObservableObject {
         #endif
     }
 
-    /// Unload all models to free memory
     public func unloadModels() {
         log("RVCInference: Unloading models...")
         hubertModel = nil
@@ -49,21 +47,15 @@ public class RVCInference: ObservableObject {
         log("RVCInference: Models unloaded.")
     }
 
-    /// Load index vectors for speaker embedding retrieval.
     public func loadIndex(url: URL, rate: Float = 0.75) throws {
         log("RVCInference: Loading index from \(url.lastPathComponent)")
         let manager = IndexManager()
-        
-        try manager.load(url: url, logger: { [weak self] msg in
-            self?.log(msg)
-        })
-        
+        try manager.load(url: url, logger: { [weak self] msg in self?.log(msg) })
         self.indexManager = manager
         self.indexRate = rate
         log("RVCInference: Index loaded with \(manager.count) vectors, rate=\(rate)")
     }
 
-    /// Unload the index to free memory.
     public func unloadIndex() {
         indexManager?.unload()
         indexManager = nil
@@ -71,7 +63,6 @@ public class RVCInference: ObservableObject {
     }
 
     public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
-        // 🚨【安全ガード】rmvpe や hubert がメインボイスモデル (modelURL) に渡された場合は処理をスキップ
         let modelName = modelURL.lastPathComponent.lowercased()
         if modelName.contains("rmvpe") || modelName.contains("hubert") {
             log("RVCInference: ⚠️ [GUARD] Invalid modelURL (\(modelURL.lastPathComponent)). RMVPE/HuBERT cannot be loaded as Synthesizer!")
@@ -80,9 +71,7 @@ public class RVCInference: ObservableObject {
 
         DispatchQueue.main.async { self.status = "Loading models..." }
         
-        // ==========================================
         // 1. Load Hubert
-        // ==========================================
         log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
         var actualHubertURL = hubertURL
         let hExt = hubertURL.pathExtension.lowercased()
@@ -130,11 +119,9 @@ public class RVCInference: ObservableObject {
                 }
             }
             
-            // Hubert Conv1d transpose: PyTorch [Out, In, K] -> MLX [Out, K, In]
             if newKey.hasSuffix(".weight") && val.ndim == 3 {
                 val = val.transposed(axes: [0, 2, 1])
             }
-            
             newParams[newKey] = val
         }
         
@@ -170,9 +157,7 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
         }
         
-        // ==========================================
-        // 2. Load Synthesizer (Main Voice Model)
-        // ==========================================
+        // 2. Load Synthesizer
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
         let modelWeights = try MLX.loadArrays(url: modelURL)
 
@@ -257,19 +242,17 @@ public class RVCInference: ObservableObject {
                 else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
-            // Synthesizer Conv transpose logic
             if newK.hasSuffix(".weight") && newV.ndim == 3 {
                 if newK.contains(".up_") || newK.contains(".ups.") {
-                    newV = newV.transposed(axes: [1, 2, 0]) // ConvTranspose1d: [In, Out, K] -> [Out, K, In]
+                    newV = newV.transposed(axes: [1, 2, 0])
                 } else {
-                    newV = newV.transposed(axes: [0, 2, 1]) // Conv1d: [Out, In, K] -> [Out, K, In]
+                    newV = newV.transposed(axes: [0, 2, 1])
                 }
             }
 
             synthParams[newK] = newV
         }
 
-        // Weight Norm Fusion for Synthesizer
         for i in 0..<4 {
             let gKey = "dec.up_\(i).weight_g"
             let vKey = "dec.up_\(i).weight_v"
@@ -277,7 +260,7 @@ public class RVCInference: ObservableObject {
             
             if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
                 let v_sqr = weight_v * weight_v
-                let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true) // PyTorch ConvTranspose1d uses dim=1 for Out
+                let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true)
                 let v_norm = sqrt(v_sum + 1e-12)
                 let weight_normalized = weight_v / v_norm
                 let weight_fused = weight_g * weight_normalized
@@ -298,7 +281,7 @@ public class RVCInference: ObservableObject {
                     
                     if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
                         let v_sqr = weight_v * weight_v
-                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true) // PyTorch Conv1d uses dim=0 for Out
+                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
                         let v_norm = sqrt(v_sum + 1e-12)
                         let weight_normalized = weight_v / v_norm
                         let weight_fused = weight_g * weight_normalized
@@ -318,9 +301,7 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Error updating Synthesizer: \(error)")
         }
         
-        // ==========================================
         // 3. Load RMVPE
-        // ==========================================
         if let rmvpeURL = rmvpeURL {
             do {
                 let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
@@ -358,12 +339,9 @@ public class RVCInference: ObservableObject {
 
                     var val = v
                     if newKey.hasSuffix(".weight") {
-                        // 1D Conv 重み修正: PyTorch [Out, In, K] -> MLX Conv1d [Out, K, In]
                         if val.ndim == 3 {
                             val = val.transposed(axes: [0, 2, 1])
-                        }
-                        // 2D Conv 重み修正: PyTorch [Out, In, H, W] -> MLX Conv2d [Out, H, W, In]
-                        else if val.ndim == 4 {
+                        } else if val.ndim == 4 {
                             val = val.transposed(axes: [0, 2, 3, 1])
                         }
                     }
@@ -397,17 +375,17 @@ public class RVCInference: ObservableObject {
     ) async {
         do {
             DispatchQueue.main.async { self.status = "Loading Audio..." }
-            let (audioArray, _) = try AudioProcessor.shared.loadAudio(url: audioURL)
+            let (audioArray, nativeSR) = try AudioProcessor.shared.loadAudio(url: audioURL)
             let totalSamples = audioArray.size
             
-            let maxSamples = 16000 * 30
+            let maxSamples = Int(nativeSR * 30.0) // 最大30秒
             var audioToProcess = audioArray
             if totalSamples > maxSamples {
                 audioToProcess = audioArray[0..<maxSamples]
             }
             
             audioToProcess = applyButterworthHighPass(audioToProcess)
-            let padSamples = 1600
+            let padSamples = Int(nativeSR * 0.1) // 0.1秒のパッディング
             let audioPadded = padReflect(audioToProcess, padding: padSamples)
             
             let outputPadded = try await inferChunk(
@@ -418,7 +396,7 @@ public class RVCInference: ObservableObject {
             )
             MLX.eval(outputPadded)
             
-            let outputRatio: Float = Float(self.modelSampleRate) / 16000.0
+            let outputRatio: Float = Float(self.modelSampleRate) / Float(nativeSR)
             let cropSamples = Int(Float(padSamples) * outputRatio)
             let outputLen = outputPadded.shape[1]
             let coreStart = cropSamples
@@ -469,12 +447,16 @@ public class RVCInference: ObservableObject {
         }
         GPU.clearCache()
         
+        // ----------------------------------------------------
+        // RMVPE による ピッチ (F0) 検出とノイズ対策カット処理
+        // ----------------------------------------------------
         var f0: MLXArray
         if let rmvpe = rmvpe {
-            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
+            // 閾値を 0.15 に上げて無音部分のノイズ判定をカット
+            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.15)
         } else {
             let frames = hubertFeatures.shape[1] * 2
-            f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
+            f0 = MLX.full([1, frames, 1], values: MLXArray(0.0)) // 無音デフォルト
         }
         MLX.eval(f0)
         GPU.clearCache()
@@ -512,13 +494,17 @@ public class RVCInference: ObservableObject {
         let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
         let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
         let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
+        
+        // F0 が f0_min (50Hz) 以下の部分はすべて無音(バケツ1)として処理
         var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
         pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
         pitch = MLX.maximum(pitch, 1.0)
         pitch = MLX.minimum(pitch, 255.0)
         let pitchBuckets = pitch.asType(Int32.self)
         
-        let nsff0 = f0Hz.expandedDimensions(axis: 2)
+        // F0Hz も同様に無音部分は 0.0 にクリア
+        let f0HzClean = MLX.where(f0Hz .<= f0_min, MLXArray(0.0), f0Hz)
+        let nsff0 = f0HzClean.expandedDimensions(axis: 2)
         let phoneLengths = MLXArray([Int32(minLen)])
         let sid = MLXArray([Int32(0)])
 
