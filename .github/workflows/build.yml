@@ -79,6 +79,9 @@ jobs:
           # Fix C++ std::allocator does not support const types error in custom_kernel.cpp
           find Source -name "custom_kernel.cpp" -exec sed -i '' 's/std::vector<const array>/std::vector<array>/g' {} + || true
           find Source -name "*.swift" -exec sed -i '' 's/target\.directoryURL/target\.directory/g' {} + || true
+          cd ../../../..
+          # Fix MLX.Memory.clearCache() -> GPU.clearCache()
+          find Demos/iOS/RVCNative/RVCNativePackage/Sources -name "*.swift" -exec sed -i '' 's/MLX\.Memory\.clearCache()/GPU\.clearCache()/g' {} + || true
 
       - name: Resolve Package Dependencies
         run: |
