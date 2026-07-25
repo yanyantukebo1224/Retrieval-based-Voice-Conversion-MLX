@@ -71,7 +71,7 @@ public class RVCInference: ObservableObject {
     }
 
     public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
-        // 🚨【安全ガード】rmvpe や hubert がメインボイスモデル (modelURL) に渡された場合は即座に弾く
+        // 🚨【安全ガード】rmvpe や hubert がメインボイスモデル (modelURL) に渡された場合は処理をスキップ
         let modelName = modelURL.lastPathComponent.lowercased()
         if modelName.contains("rmvpe") || modelName.contains("hubert") {
             log("RVCInference: ⚠️ [GUARD] Invalid modelURL (\(modelURL.lastPathComponent)). RMVPE/HuBERT cannot be loaded as Synthesizer!")
@@ -305,10 +305,12 @@ public class RVCInference: ObservableObject {
 
                     var val = v
                     if newKey.hasSuffix(".weight") {
+                        // 1D Conv 重み修正: PyTorch [Out, In, K] -> MLX Conv1d [Out, K, In]
                         if val.ndim == 3 {
-                            val = val.expandedDimensions(axis: 2)
+                            val = val.transposed(axes: [0, 2, 1])
                         }
-                        if val.ndim == 4 {
+                        // 2D Conv 重み修正: PyTorch [Out, In, H, W] -> MLX Conv2d [Out, H, W, In]
+                        else if val.ndim == 4 {
                             val = val.transposed(axes: [0, 2, 3, 1])
                         }
                     }
