@@ -716,21 +716,28 @@ import MLXNN
             f0Method: String,
             indexRate: Float
         ) async throws -> MLXArray {
-            // chunk: [T] - 16kHz
+            // 1. Audio input validation & shape safety
+            var cleanAudio = chunk
+            if cleanAudio.ndim == 2 {
+                cleanAudio = cleanAudio.mean(axis: 0) // Convert stereo to mono
+            }
+            if cleanAudio.ndim != 1 {
+                cleanAudio = cleanAudio.flattened()
+            }
             
             // DEBUG: Log audio input stats
-            log("DEBUG: Audio input - shape: \(chunk.shape), min: \(chunk.min().item(Float.self)), max: \(chunk.max().item(Float.self)), mean: \(chunk.mean().item(Float.self))")
+            log("DEBUG: Audio input - shape: \(cleanAudio.shape), min: \(cleanAudio.min().item(Float.self)), max: \(cleanAudio.max().item(Float.self)), mean: \(cleanAudio.mean().item(Float.self))")
             
             // Log first 20 audio samples
-            let audioSlice = chunk[0..<min(20, chunk.shape[0])].asType(Float.self)
+            let audioSlice = cleanAudio[0..<min(20, cleanAudio.shape[0])].asType(Float.self)
             MLX.eval(audioSlice)
             let audioSamples = audioSlice.asArray(Float.self)
             log("DEBUG: Audio input (padded, filtered) first 20 samples: \(audioSamples)")
              
-            // 1. Hubert Feature Extraction (16kHz -> 50fps)
-            let audioInput = chunk.expandedDimensions(axis: 0) // [1, T]
+            // 2. Hubert Feature Extraction (16kHz -> 50fps)
+            let audioInput = cleanAudio.expandedDimensions(axis: 0) // [1, T]
             guard let hubertModel = hubertModel else {
-                throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "Hubert model missing"])
+                throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded. Please ensure hubert_base.safetensors exists in Documents."])
             }
             let hubertFeatures: MLXArray = autoreleasepool {
                 let feat = hubertModel(audioInput) // [1, Frames, 768]
@@ -748,77 +755,32 @@ import MLXNN
                 log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
             }
 
-
-            // 2. F0 Estimation (16kHz -> 100fps)
-            // Dispatch to appropriate F0 method
+            // 3. F0 Estimation (16kHz -> 100fps)
             var f0: MLXArray
             switch f0Method.lowercased() {
             case "crepe", "crepe-full":
                 if let crepe = crepe {
-                    f0 = crepe.getF0(audio: chunk, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
+                    f0 = crepe.getF0(audio: cleanAudio, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
                     log("DEBUG: CREPE F0 shape: \(f0.shape)")
+                } else if let rmvpe = rmvpe {
+                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
                 } else {
-                    // Fallback to RMVPE if CREPE not loaded
-                    log("WARN: CREPE not loaded, falling back to RMVPE")
-                    if let rmvpe = rmvpe {
-                        f0 = rmvpe.infer(audio: chunk, thred: 0.03)
-                    } else {
-                        let frames = hubertFeatures.shape[1] * 2
-                        f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-                    }
-                }
-
-            case "crepe-tiny":
-                // CREPE tiny variant (same interface, just different weights)
-                if let crepe = crepe {
-                    f0 = crepe.getF0(audio: chunk, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
-                    log("DEBUG: CREPE-tiny F0 shape: \(f0.shape)")
-                } else {
-                    log("WARN: CREPE-tiny not loaded, falling back to RMVPE")
-                    if let rmvpe = rmvpe {
-                        f0 = rmvpe.infer(audio: chunk, thred: 0.03)
-                    } else {
-                        let frames = hubertFeatures.shape[1] * 2
-                        f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-                    }
+                    let frames = hubertFeatures.shape[1] * 2
+                    f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
                 }
 
             case "rmvpe":
                 if let rmvpe = rmvpe {
-                    f0 = rmvpe.infer(audio: chunk, thred: 0.03)
+                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
                 } else {
                     log("WARN: RMVPE not loaded, using fallback F0")
                     let frames = hubertFeatures.shape[1] * 2
                     f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
                 }
 
-            case "dio":
-                // Initialize DSP extractor if needed
-                if dspPitch == nil {
-                    dspPitch = DSPPitchExtractor(sampleRate: 16000, hopSize: 160)
-                }
-                f0 = dspPitch!.dio(audio: chunk, f0Min: 50.0, f0Max: 1100.0)
-                log("DEBUG: DIO F0 shape: \(f0.shape)")
-
-            case "pm":
-                if dspPitch == nil {
-                    dspPitch = DSPPitchExtractor(sampleRate: 16000, hopSize: 160)
-                }
-                f0 = dspPitch!.pm(audio: chunk, f0Min: 50.0, f0Max: 1100.0)
-                log("DEBUG: PM F0 shape: \(f0.shape)")
-
-            case "harvest":
-                if dspPitch == nil {
-                    dspPitch = DSPPitchExtractor(sampleRate: 16000, hopSize: 160)
-                }
-                f0 = dspPitch!.harvest(audio: chunk, f0Min: 50.0, f0Max: 1100.0)
-                log("DEBUG: HARVEST F0 shape: \(f0.shape)")
-
             default:
-                // Unknown method - use RMVPE
-                log("WARN: Unknown F0 method '\(f0Method)', using RMVPE")
                 if let rmvpe = rmvpe {
-                    f0 = rmvpe.infer(audio: chunk, thred: 0.03)
+                    f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
                 } else {
                     let frames = hubertFeatures.shape[1] * 2
                     f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
@@ -827,99 +789,51 @@ import MLXNN
             MLX.eval(f0)
             GPU.clearCache()  // MEMORY FIX: Clear after F0 estimation
             
-            // 3. Upsample Hubert Features to match F0 (100fps)
+            // 4. Upsample Hubert Features & Strict Frame Alignment
             let N = hubertFeatures.shape[0]
             let L = hubertFeatures.shape[1]
             let C = hubertFeatures.shape[2]
             
-            // Simple repeat upsampling: [1, L, 768] -> [1, L, 2, 768] -> [1, L*2, 768]
             let expanded = hubertFeatures.expandedDimensions(axis: 2)
             let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
             var phone = broadcasted.reshaped([N, L * 2, C])
-            log("DEBUG: Upsampled phone shape: \(phone.shape)")
+            
+            // Length Guard: Align phone & f0 length exactly
+            let phoneLen = phone.shape[1]
+            let f0Len = f0.shape[1]
+            let minLen = min(phoneLen, f0Len)
+            
+            if phoneLen != minLen {
+                phone = phone[0..., 0..<minLen, 0...]
+            }
+            if f0Len != minLen {
+                f0 = f0[0..., 0..<minLen, 0...]
+            }
+            log("DEBUG: Aligned phone shape: \(phone.shape), f0 shape: \(f0.shape)")
 
-            // 3b. Apply index retrieval if loaded (speaker embedding blending)
-            if let indexManager = indexManager, indexRate > 0 {
-                phone = indexManager.search(features: phone, indexRate: indexRate)
-                log("DEBUG: Applied index retrieval with rate=\(indexRate)")
+            // 5. Optional FAISS Index Retrieval
+            if indexRate > 0, let indexReader = indexReader {
+                do {
+                    phone = try indexReader.retrieve(phone: phone, indexRate: indexRate)
+                    log("DEBUG: FAISS Index retrieval completed.")
+                } catch {
+                    log("WARN: FAISS Index retrieval failed (skipping index): \(error.localizedDescription)")
+                }
             }
 
-            // 4. Coarse Pitch calculation (Hz -> Bucket 1-255)
-            var f0Hz = f0.squeezed(axes: [2]) // [1, L_f0]
-
-            // 4a. Apply pitch shift: f0_shifted = f0 * 2^(semitones/12)
-            if pitchShift != 0 {
-                let multiplier = pow(2.0, Float(pitchShift) / 12.0)
-                f0Hz = f0Hz * multiplier
-                log("DEBUG: Applied pitch shift of \(pitchShift) semitones (multiplier: \(multiplier))")
-            }
-
-            let f0_min: Float = 50.0
-            let f0_max: Float = 1100.0
-            let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
-            let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
-            
-            // MLX Mel calculation: 1127 * ln(1 + f/700)
-            let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
-            
-            // Bucket quantization
-            var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
-            pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
-            pitch = MLX.maximum(pitch, 1.0)
-            pitch = MLX.minimum(pitch, 255.0)
-            let pitchBuckets = pitch.asType(Int32.self)
-            
-            // 5. Sync lengths
-            let p_len_val = min(phone.shape[1], f0Hz.shape[1])
-            phone = phone[0..., 0..<p_len_val, 0...]
-            let nsff0 = f0Hz[0..., 0..<p_len_val].expandedDimensions(axis: 2)
-            let pitchFinal = pitchBuckets[0..., 0..<p_len_val]
-            let phoneLengths = MLXArray([Int32(p_len_val)])
-            
-            // LOGGING FOR PARITY CHECK: Dump first 20 values of inputs
-            if true { // Always log for debug
-                log("DEBUG DATA DUMP:")
-                
-                // 1. F0 (Raw Hz) - use asArray to avoid .item() precondition failure
-                let f0Slice = nsff0[0, 0..<min(20, p_len_val), 0].asType(Float.self)
-                MLX.eval(f0Slice)
-                let f0Values = f0Slice.asArray(Float.self)
-                let f0Str = "F0 (First 20): [\(f0Values.map { String(format: "%.4f", $0) }.joined(separator: ", "))]"
-                log(f0Str)
-                
-                // 2. Pitch (Buckets)
-                let pitchSlice = pitchFinal[0, 0..<min(20, p_len_val)].asType(Int32.self)
-                MLX.eval(pitchSlice)
-                let pitchValues = pitchSlice.asArray(Int32.self)
-                let pitchStr = "Pitch (First 20): [\(pitchValues.map { String($0) }.joined(separator: ", "))]"
-                log(pitchStr)
-                
-                // 3. Phone (First feature of first 20 frames)
-                let phoneSlice = phone[0, 0..<min(20, p_len_val), 0].asType(Float.self)
-                MLX.eval(phoneSlice)
-                let phoneValues = phoneSlice.asArray(Float.self)
-                let phoneStr = "Phone[0] (First 20): [\(phoneValues.map { String(format: "%.4f", $0) }.joined(separator: ", "))]"
-                log(phoneStr)
-            }
-            
             // 6. Synthesizer Inference
-            guard let synthesizer = synthesizer else {
-                throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "Synthesizer missing"])
+            guard let synth = synthesizer else {
+                throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded in Synthesizer"])
             }
-            
-            let sid = MLXArray([Int32(0)]) // Default speaker 0
 
-            log("DEBUG: Before Synthesizer - phone: \(phone.shape), pitch: \(pitchFinal.shape), nsff0: \(nsff0.shape)")
+            let audioConverted: MLXArray = try autoreleasepool {
+                let out = try synth.infer(phone: phone, f0: f0, pitchShift: pitchShift)
+                MLX.eval(out)
+                return out
+            }
+            GPU.clearCache()
 
-            let audioOut = synthesizer.infer(
-                phone: phone,
-                phoneLengths: phoneLengths,
-                pitch: pitchFinal,
-                nsff0: nsff0,
-                sid: sid
-            )
-            
-        return audioOut // [1, T_out, 1]
+            return audioConverted
         }
 
         /// Run benchmark: perform inference and compare with reference audio
