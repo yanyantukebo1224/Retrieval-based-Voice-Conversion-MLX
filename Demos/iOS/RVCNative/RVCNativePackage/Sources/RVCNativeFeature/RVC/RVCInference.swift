@@ -133,7 +133,6 @@ public class RVCInference: ObservableObject {
                 }
             }
             
-            // Note: Removed the forced Conv1d transposition here to match HubertModel's Conv1d expectations
             newParams[newKey] = val
         }
         
@@ -518,7 +517,9 @@ public class RVCInference: ObservableObject {
             cleanAudio = cleanAudio.flattened()
         }
         
-        let audioInput = cleanAudio.expandedDimensions(axis: 0)
+        // 【アダプター修正】HubertFeatureExtractorの入力要件（expandedDimensions(axis: -1)）に一致させるため [Batch, Length, 1] に整形
+        var audioInput = cleanAudio.expandedDimensions(axis: 0) // [1, Length]
+        audioInput = audioInput.expandedDimensions(axis: -1)     // [1, Length, 1]
         
         guard let hubertModel = hubertModel else {
             throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
