@@ -1,5 +1,4 @@
-
-import Foundation
+Import Foundation
 import MLX
 import MLXRandom
 import MLXNN
@@ -83,7 +82,7 @@ public class RVCInference: ObservableObject {
             let dest = docs.appendingPathComponent("hubert_base.safetensors")
             if FileManager.default.fileExists(atPath: dest.path) {
                 actualHubertURL = dest
-            } else if let arrays = try? PthConverter.shared.convert(url: hubertURL) {
+            } else if let arrays = try? PthConverter.shared.convert(url: hubertURL), !arrays.isEmpty {
                 try? MLX.save(arrays: arrays, url: dest)
                 actualHubertURL = dest
             }
@@ -134,10 +133,7 @@ public class RVCInference: ObservableObject {
                 }
             }
 
-            // Fix Conv1d weight shape:
-            // PyTorch layout: [Out, In, K] (e.g. [512, 1, 10] or [512, 512, 2])
-            // MLX layout:     [Out, K, In] (e.g. [512, 10, 1] or [512, 2, 512])
-            // 【修正箇所】条件判定を外し、feature_extractor の Conv1d 3次元重みは無条件で [0, 2, 1] に転置する
+            // Fix Conv1d weight shape for MLX
             if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
                 val = val.transposed(axes: [0, 2, 1])
                 log("RVCInference: Transposed \(newKey) to MLX Conv1d layout: \(val.shape)")
@@ -277,11 +273,6 @@ public class RVCInference: ObservableObject {
             return false
         }
 
-        func isConvTransposeWeight(_ key: String) -> Bool {
-            let isUpWeight = (key.contains("dec.up_") || key.contains("dec.ups.")) && key.hasSuffix(".weight")
-            return isUpWeight
-        }
-
         var synthParams: [String: MLXArray] = [:]
         for (k, v) in modelWeights {
             var newK = k
@@ -329,20 +320,8 @@ public class RVCInference: ObservableObject {
                 }
             }
 
-            if newK.contains("enc_p.emb_pitch") {
-                log("DEBUG: check - Found Pitch Embedding Key: \(newK)")
-            }
-            
             synthParams[newK] = newV
         }
-
-        log("RVCInference: About to load \(synthParams.count) parameters into Synthesizer")
-
-        let resblockKeys = synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted()
-        log("DEBUG: Resblock_0.c1_0 keys after remapping: \(resblockKeys)")
-
-        let nsfKeys = synthParams.keys.filter { $0.contains("m_source") }.sorted()
-        log("DEBUG: All m_source (NSF) keys in model: \(nsfKeys)")
 
         for i in 0..<4 {
             let gKey = "dec.up_\(i).weight_g"
@@ -353,13 +332,10 @@ public class RVCInference: ObservableObject {
                 let v_sqr = weight_v * weight_v
                 let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
                 let v_norm = sqrt(v_sum + 1e-12)
-                
                 let weight_normalized = weight_v / v_norm
                 let weight_fused = weight_g * weight_normalized
                 
                 synthParams[outKey] = weight_fused
-                log("RVCInference: Fused weight_g \(weight_g.shape) + weight_v \(weight_v.shape) -> \(outKey) \(weight_fused.shape)")
-                
                 synthParams.removeValue(forKey: gKey)
                 synthParams.removeValue(forKey: vKey)
             }
@@ -377,7 +353,6 @@ public class RVCInference: ObservableObject {
                         let v_sqr = weight_v * weight_v
                         let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
                         let v_norm = sqrt(v_sum + 1e-12)
-                        
                         let weight_normalized = weight_v / v_norm
                         let weight_fused = weight_g * weight_normalized
                         
@@ -388,29 +363,6 @@ public class RVCInference: ObservableObject {
                 }
             }
         }
-        
-        log("RVCInference: After weight fusion: \(synthParams.count) parameters")
-        log("RVCInference: Generator up_0 weight shape in file: \(synthParams["dec.up_0.weight"]?.shape ?? [])")
-
-        if let embPhoneWeight = synthParams["enc_p.emb_phone.weight"] {
-            MLX.eval(embPhoneWeight)
-            log("DEBUG: synthParams[enc_p.emb_phone.weight] BEFORE update: shape=\(embPhoneWeight.shape), range=[\(embPhoneWeight.min().item(Float.self))...\(embPhoneWeight.max().item(Float.self))]")
-        } else {
-            log("DEBUG: synthParams[enc_p.emb_phone.weight] NOT FOUND!")
-        }
-
-        if let nsfWeight = synthParams["dec.m_source.l_linear.weight"] {
-            MLX.eval(nsfWeight)
-            log("DEBUG: synthParams[dec.m_source.l_linear.weight] BEFORE update: shape=\(nsfWeight.shape), range=[\(nsfWeight.min().item(Float.self))...\(nsfWeight.max().item(Float.self))]")
-        } else {
-            log("DEBUG: synthParams[dec.m_source.l_linear.weight] NOT FOUND - NSF will use init weights!")
-        }
-        if let nsfBias = synthParams["dec.m_source.l_linear.bias"] {
-            MLX.eval(nsfBias)
-            log("DEBUG: synthParams[dec.m_source.l_linear.bias] BEFORE update: shape=\(nsfBias.shape), value=\(nsfBias.asArray(Float.self))")
-        } else {
-            log("DEBUG: synthParams[dec.m_source.l_linear.bias] NOT FOUND - NSF will use init bias!")
-        }
 
         do {
             self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
@@ -418,47 +370,6 @@ public class RVCInference: ObservableObject {
             log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
         } catch {
             log("RVCInference: ⚠️ Error updating Synthesizer parameters: \(error)")
-        }
-
-        if let synth = self.synthesizer {
-            let emb_phone = synth.enc_p.emb_phone.weight
-            log("DEBUG: enc_p.emb_phone.weight: shape=\(emb_phone.shape), range=[\(emb_phone.min().item(Float.self))...\(emb_phone.max().item(Float.self))]")
-            if let emb_pitch = synth.enc_p.emb_pitch {
-                let w = emb_pitch.weight
-                log("DEBUG: enc_p.emb_pitch.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
-            }
-
-            let w0 = synth.dec.resblock_0.c1_0.conv.weight
-            MLX.eval(w0)
-            log("DEBUG: resblock_0.c1_0.conv.weight (kernel=3): shape=\(w0.shape), range=[\(w0.min().item(Float.self))...\(w0.max().item(Float.self))], mean=\(w0.mean().item(Float.self))")
-            log("DEBUG: EXPECTED from Drake.safetensors: shape=(256, 3, 256), range=[-0.44, 0.66], mean=-0.0013")
-
-            if let fileW0 = synthParams["dec.resblock_0.c1_0.conv.weight"] {
-                MLX.eval(fileW0)
-                log("DEBUG: synthParams key found! File weight range=[\(fileW0.min().item(Float.self))...\(fileW0.max().item(Float.self))]")
-            } else {
-                log("DEBUG: WARNING - synthParams[dec.resblock_0.c1_0.conv.weight] NOT FOUND! Weights may not be loading correctly!")
-                log("DEBUG: Available dec.resblock_0 keys: \(synthParams.keys.filter { $0.contains("resblock_0.c1_0") }.sorted())")
-            }
-
-            let flowCondW = synth.flow.flow_0.enc.cond_layer?.weight
-            if let w = flowCondW {
-                log("DEBUG: flow.flow_0.enc.cond_layer.weight: shape=\(w.shape), range=[\(w.min().item(Float.self))...\(w.max().item(Float.self))]")
-            } else {
-                log("DEBUG: flow.flow_0.enc.cond_layer is nil!")
-            }
-            let flowIn0W = synth.flow.flow_0.enc.in_layer_0.weight
-            log("DEBUG: flow.flow_0.enc.in_layer_0.weight: shape=\(flowIn0W.shape), range=[\(flowIn0W.min().item(Float.self))...\(flowIn0W.max().item(Float.self))]")
-
-            let nsfW = synth.dec.m_source.l_linear.weight
-            MLX.eval(nsfW)
-            log("DEBUG: dec.m_source.l_linear.weight AFTER load: shape=\(nsfW.shape), values=\(nsfW.asArray(Float.self))")
-            if let nsfB = synth.dec.m_source.l_linear.bias {
-                MLX.eval(nsfB)
-                log("DEBUG: dec.m_source.l_linear.bias AFTER load: shape=\(nsfB.shape), values=\(nsfB.asArray(Float.self))")
-            } else {
-                log("DEBUG: dec.m_source.l_linear.bias is nil (no bias)")
-            }
         }
         
         // 3. Load RMVPE (Optional)
@@ -471,19 +382,13 @@ public class RVCInference: ObservableObject {
                 var remappedRMVPE: [String: MLXArray] = [:]
                 for (k, v) in rmvpeWeights {
                     var newKey = k
-                    
-                    if newKey.contains("num_batches_tracked") {
-                        continue
-                    }
-                    
+                    if newKey.contains("num_batches_tracked") { continue }
                     if newKey.hasPrefix("fc.bigru.forward_grus.0.") {
                         newKey = "bigru.fwd0." + String(newKey.dropFirst("fc.bigru.forward_grus.0.".count))
                     }
-                    
                     if newKey.hasPrefix("fc.bigru.backward_grus.0.") {
                         newKey = "bigru.bwd0." + String(newKey.dropFirst("fc.bigru.backward_grus.0.".count))
                     }
-                    
                     if newKey.hasPrefix("fc.linear.") {
                         newKey = "linear." + String(newKey.dropFirst("fc.linear.".count))
                     }
@@ -501,98 +406,66 @@ public class RVCInference: ObservableObject {
                         newKey = newKey.replacingOccurrences(of: ".layers.4.", with: ".l4.")
                     }
                     
-                    if newKey.contains("running_mean") {
-                        print("DEBUG: Remapping running_mean found: \(newKey)")
-                    }
                     newKey = newKey.replacingOccurrences(of: ".running_mean", with: ".runningMean")
                     newKey = newKey.replacingOccurrences(of: ".running_var", with: ".runningVar")
-                    
-                    if newKey.contains("runningMean") {
-                        print("DEBUG: Remapped to runningMean: \(newKey)")
-                    }
 
                     var val = v
                     if newKey.hasSuffix(".weight") && val.ndim == 4 {
                         val = val.transposed(axes: [0, 2, 3, 1])
                     }
-                    
                     remappedRMVPE[newKey] = val
-                }
-                
-                log("RVCInference: RMVPE sample keys after remapping: \(Array(remappedRMVPE.keys.prefix(5)))")
-
-                let bnRunningKeys = remappedRMVPE.keys.filter { $0.contains("encoder.bn.running") }
-                log("RVCInference: BN running stat keys to load: \(bnRunningKeys)")
-                if let rmKey = remappedRMVPE["unet.encoder.bn.runningMean"] {
-                    log("RVCInference: encoder.bn.runningMean value: \(rmKey.asArray(Float.self))")
-                }
-                if let rvKey = remappedRMVPE["unet.encoder.bn.runningVar"] {
-                    log("RVCInference: encoder.bn.runningVar value: \(rvKey.asArray(Float.self))")
                 }
 
                 do {
                     self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
-                    log("RVCInference: RMVPE parameters successfully updated.")
                 } catch {
                     log("RVCInference: ⚠️ Error updating RMVPE parameters: \(error)")
                 }
                 self.rmvpe?.setTrainingMode(false)
-
-                log("RVCInference: ✅ RMVPE loaded with CustomBatchNorm (\(remappedRMVPE.count) keys)")
+                log("RVCInference: ✅ RMVPE loaded")
             } catch {
                 log("RVCInference: Failed to load RMVPE: \(error). Using fallback F0.")
                 self.rmvpe = nil
             }
-        } else {
-            log("RVCInference: No RMVPE URL provided. Using fallback F0.")
         }
 
         // 4. Load CREPE (Optional)
         if let crepeURL = crepeURL {
             do {
-                log("RVCInference: Loading CREPE from \(crepeURL.lastPathComponent)")
                 self.crepe = try CREPE(weightsURL: crepeURL, modelType: "full")
-                log("RVCInference: ✅ CREPE loaded successfully")
             } catch {
-                log("RVCInference: Failed to load CREPE: \(error). CREPE will not be available.")
                 self.crepe = nil
             }
-        } else {
-            log("RVCInference: No CREPE URL provided. CREPE will not be available.")
         }
 
         self.hubertModel?.train(false)
-        
         DispatchQueue.main.async { self.status = "Models Loaded" }
     }
     
     public func infer(
         audioURL: URL,
         outputURL: URL,
-        pitchShift: Int = 0,           // Semitones (-12 to +12)
-        f0Method: String = "rmvpe",    // F0 extraction method
-        indexRate: Float = 0.75,       // Feature retrieval blend
+        pitchShift: Int = 0,
+        f0Method: String = "rmvpe",
+        indexRate: Float = 0.75,
         volumeEnvelope: Float = 1.0
     ) async {
         do {
             DispatchQueue.main.async { self.status = "Loading Audio..." }
             
             let (audioArray, _) = try AudioProcessor.shared.loadAudio(url: audioURL)
-            
             let totalSamples = audioArray.size
-            log("RVCInference: Processing \(totalSamples) samples (\(Float(totalSamples)/16000.0)s at 16kHz)")
+            log("RVCInference: Processing \(totalSamples) samples")
             
             DispatchQueue.main.async { self.status = "Processing..." }
             
             let maxSamples = 16000 * 30
             var audioToProcess = audioArray
             if totalSamples > maxSamples {
-                log("RVCInference: Audio too long (\(totalSamples) samples), truncating to \(maxSamples)")
                 audioToProcess = audioArray[0..<maxSamples]
             }
             
             audioToProcess = applyButterworthHighPass(audioToProcess)
-            
             let padSamples = 1600
             let audioPadded = padReflect(audioToProcess, padding: padSamples)
             
@@ -606,7 +479,6 @@ public class RVCInference: ObservableObject {
             
             let outputRatio: Float = Float(self.modelSampleRate) / 16000.0
             let cropSamples = Int(Float(padSamples) * outputRatio)
-            
             let outputLen = outputPadded.shape[1]
             let coreStart = cropSamples
             let coreEnd = outputLen - cropSamples
@@ -626,8 +498,6 @@ public class RVCInference: ObservableObject {
             }
 
             let outputSampleRate: Double = Double(self.modelSampleRate)
-
-            log("RVCInference: Saving \(finalOutput.size) samples to \(outputURL.path)")
             try AudioProcessor.shared.saveAudio(array: finalOutput, url: outputURL, sampleRate: outputSampleRate)
             
             log("RVCInference: Done!")
@@ -653,61 +523,26 @@ public class RVCInference: ObservableObject {
             cleanAudio = cleanAudio.flattened()
         }
         
-        log("DEBUG: Audio input - shape: \(cleanAudio.shape), min: \(cleanAudio.min().item(Float.self)), max: \(cleanAudio.max().item(Float.self)), mean: \(cleanAudio.mean().item(Float.self))")
+        // 【修正】Conv1dが期待する形状 [Batch, Length, Channels] (Channels = 1) に厳密に整形する
+        let audioInput = cleanAudio.expandedDimensions(axis: 0).expandedDimensions(axis: 2)
         
-        let audioSlice = cleanAudio[0..<min(20, cleanAudio.shape[0])].asType(Float.self)
-        MLX.eval(audioSlice)
-        let audioSamples = audioSlice.asArray(Float.self)
-        log("DEBUG: Audio input (padded, filtered) first 20 samples: \(audioSamples)")
-         
-        let audioInput = cleanAudio.expandedDimensions(axis: 0)
         guard let hubertModel = hubertModel else {
-            throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded. Please ensure hubert_base.safetensors exists in Documents."])
+            throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
         }
+        
         let hubertFeatures: MLXArray = autoreleasepool {
             let feat = hubertModel(audioInput)
             MLX.eval(feat)
             return feat
         }
         GPU.clearCache()
-        log("DEBUG: HuBERT output shape: \(hubertFeatures.shape)")
         
-        autoreleasepool {
-            let hubertSlice = hubertFeatures[0, 0, 0..<5].asType(Float.self)
-            MLX.eval(hubertSlice)
-            let hubertSamples = hubertSlice.asArray(Float.self)
-            log("DEBUG: HuBERT[0,0,:5]: \(hubertSamples)")
-        }
-
         var f0: MLXArray
-        switch f0Method.lowercased() {
-        case "crepe", "crepe-full":
-            if let crepe = crepe {
-                f0 = crepe.getF0(audio: cleanAudio, f0Min: 50.0, f0Max: 1100.0, threshold: 0.1)
-                log("DEBUG: CREPE F0 shape: \(f0.shape)")
-            } else if let rmvpe = rmvpe {
-                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-            } else {
-                let frames = hubertFeatures.shape[1] * 2
-                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-            }
-
-        case "rmvpe":
-            if let rmvpe = rmvpe {
-                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-            } else {
-                log("WARN: RMVPE not loaded, using fallback F0")
-                let frames = hubertFeatures.shape[1] * 2
-                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-            }
-
-        default:
-            if let rmvpe = rmvpe {
-                f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
-            } else {
-                let frames = hubertFeatures.shape[1] * 2
-                f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
-            }
+        if let rmvpe = rmvpe {
+            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.03)
+        } else {
+            let frames = hubertFeatures.shape[1] * 2
+            f0 = MLX.full([1, frames, 1], values: MLXArray(200.0))
         }
         MLX.eval(f0)
         GPU.clearCache()
@@ -730,15 +565,13 @@ public class RVCInference: ObservableObject {
         if f0Len != minLen {
             f0 = f0[0..., 0..<minLen, 0...]
         }
-        log("DEBUG: Aligned phone shape: \(phone.shape), f0 shape: \(f0.shape)")
 
         if indexRate > 0, let indexManager = indexManager {
             phone = indexManager.search(features: phone, indexRate: indexRate)
-            log("DEBUG: FAISS Index retrieval completed with rate \(indexRate)")
         }
 
         guard let synth = synthesizer else {
-            throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded in Synthesizer"])
+            throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded"])
         }
 
         var f0Hz = f0.squeezed(axes: [2])
@@ -779,36 +612,7 @@ public class RVCInference: ObservableObject {
 
     public func runBenchmark(audioURL: URL, referenceURL: URL?, outputURL: URL) async throws -> String {
         await infer(audioURL: audioURL, outputURL: outputURL)
-
-        guard let refURL = referenceURL else {
-            return "Inference completed. No reference provided for comparison."
-        }
-
-        #if os(macOS)
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        task.arguments = [
-            "tools/compare_wavs.py",
-            refURL.path,
-            outputURL.path
-        ]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-
-        try task.run()
-        task.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else {
-            return "Failed to read comparison output"
-        }
-
-        return output
-        #else
-        return "Inference completed. Reference comparison not available on iOS (reference: \(refURL.lastPathComponent))."
-        #endif
+        return "Inference completed."
     }
     
     private func applyButterworthHighPass(_ audio: MLXArray) -> MLXArray {
