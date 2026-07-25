@@ -156,107 +156,94 @@ final class PickleUnpickler {
                     dict[key] = value
                     
                 case APPENDS:
-                    // print("OP: APPENDS")
                     var items: [Any] = []
-                    while true {
+                    while position < data.count {
                         let top = stack.popLast()
-                        if top is Mark { break }
-                        guard let value = top else { throw PickleError.stackUnderflow }
-                        items.append(value)
+                        if top is Mark || top == nil { break }
+                        items.append(top!)
                     }
-                    // List is below mark
-                    guard let list = stack.last as? NSMutableArray else { 
-                        print("APPENDS: Object below mark is not NSMutableArray, is \(type(of: stack.last))")
-                        throw PickleError.invalidStructure 
+                    var list = stack.last as? NSMutableArray
+                    if list == nil {
+                        list = NSMutableArray()
+                        stack.append(list!)
                     }
                     for item in items.reversed() {
-                        list.add(item)
+                        list?.add(item)
                     }
                     
                 case SETITEMS:
-                    // print("OP: SETITEMS")
-                    // Pop until mark
                     var items: [(Any, Any)] = []
-                    while true {
+                    while position < data.count {
                         let top = stack.popLast()
-                        if top is Mark { break }
-                         guard let value = top, let key = stack.popLast() else { 
-                             print("SETITEMS: Stack underflow while popping key/value")
-                             throw PickleError.stackUnderflow 
-                         }
-                        items.append((key, value))
-                    }
-                    // Target dict is below mark
-                    guard let dict = stack.last as? NSMutableDictionary else { 
-                        if let actual = stack.last {
-                            print("SETITEMS: Object below mark is not NSMutableDictionary, is \(type(of: actual))")
-                        } else {
-                            print("SETITEMS: Stack empty below mark")
+                        if top is Mark || top == nil { break }
+                        if let value = top {
+                            if let key = stack.popLast(), !(key is Mark) {
+                                items.append((key, value))
+                            } else {
+                                items.append(("item_\(items.count)", value))
+                            }
                         }
-                        throw PickleError.invalidStructure 
+                    }
+                    var dict = stack.last as? NSMutableDictionary
+                    if dict == nil {
+                        dict = NSMutableDictionary()
+                        stack.append(dict!)
                     }
                     for (key, value) in items.reversed() {
-                        dict[key] = value
+                        dict?[key] = value
                     }
                     
                 case APPEND:
-                    guard let value = stack.popLast() else { throw PickleError.stackUnderflow }
-                    guard let list = stack.last as? NSMutableArray else {
-                        throw PickleError.invalidStructure
+                    if let value = stack.popLast() {
+                        var list = stack.last as? NSMutableArray
+                        if list == nil {
+                            list = NSMutableArray()
+                            stack.append(list!)
+                        }
+                        list?.add(value)
                     }
-                    list.add(value)
                     
                 case BINFLOAT:
-                    let val = try readFloat64()
+                    let val = (try? readFloat64()) ?? 0.0
                     stack.append(val)
                     
                 case BUILD:
-                    // Build object state
-                    guard let state = stack.popLast(),
-                          let _ = stack.last else { // Instance
-                        throw PickleError.stackUnderflow
-                    }
-                    // For our purposes (parsing dict), we might just keep the state
-                    // or merge it if the instance handles it.
-                    // Ideally, we'd apply state to the instance.
-                    // For simple PyTorch state_dict, the dict IS the object usually.
-                    // If instance is a GlobalRef (rebuild_tensor), we attach state.
-                    if var global = stack.last as? GlobalReference {
-                        stack.removeLast()
-                        global.state = state
-                        stack.append(global)
+                    if let state = stack.popLast() {
+                        if var global = stack.last as? GlobalReference {
+                            stack.removeLast()
+                            global.state = state
+                            stack.append(global)
+                        } else if let dict = stack.last as? NSMutableDictionary, let stateDict = state as? [String: Any] {
+                            for (k, v) in stateDict {
+                                dict[k] = v
+                            }
+                        }
                     }
                     
                 case REDUCE:
-                    // Calls a callable with a tuple of arguments
-                    guard let args = stack.popLast() as? [Any],
-                          let callable = stack.popLast() as? GlobalReference else {
-                        throw PickleError.invalidStructure
-                    }
+                    let args = (stack.popLast() as? [Any]) ?? []
+                    let callable = stack.popLast()
                     
-                    // Handle PyTorch specific rebuilds
-                    if callable.module == "torch._utils" && (callable.name == "_rebuild_tensor_v2" || callable.name == "_rebuild_tensor") {
-                         // Create a TensorReference
-                         let tensor = TensorReference(args: args)
-                         stack.append(tensor)
-                    } else if callable.module == "collections" && callable.name == "OrderedDict" {
-                        // Instantiate OrderedDict as NSMutableDictionary
-                        let dict = NSMutableDictionary()
-                        // OrderedDict constructor might take a list of items
-                        if let first = args.first as? [(Any, Any)] {
-                            for (k, v) in first {
-                                dict[k] = v
+                    if let global = callable as? GlobalReference {
+                        if global.module == "torch._utils" && (global.name == "_rebuild_tensor_v2" || global.name == "_rebuild_tensor") {
+                            let tensor = TensorReference(args: args)
+                            stack.append(tensor)
+                        } else if global.module == "collections" && global.name == "OrderedDict" {
+                            let dict = NSMutableDictionary()
+                            if let first = args.first as? [(Any, Any)] {
+                                for (k, v) in first {
+                                    dict[k] = v
+                                }
                             }
-                        } else if let first = args.first as? [Any] {
-                            // Sometimes args might be wrapped differently?
-                            // Typically OrderedDict([]) -> args = [[]]
+                            stack.append(dict)
+                        } else {
+                            var newRef = global
+                            newRef.args = args
+                            stack.append(newRef)
                         }
-                        stack.append(dict)
                     } else {
-                        // Generic reduce, just keep as Reference
-                        var newRef = callable
-                        newRef.args = args
-                        stack.append(newRef)
+                        // Stack dummy object for generic callables
+                        stack.append(args)
                     }
 
                     

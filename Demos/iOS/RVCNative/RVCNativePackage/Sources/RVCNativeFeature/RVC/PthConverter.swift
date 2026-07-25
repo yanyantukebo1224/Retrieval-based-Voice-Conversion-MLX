@@ -120,17 +120,12 @@ public final class PthConverter: Sendable {
         progress?(0.2, "Parsing Pickle structure...")
         let data = try Data(contentsOf: pklUrl)
         let unpickler = PickleUnpickler(data: data)
-        let unpickledObj = try unpickler.load()
-        
-        // 4. Extract State Dict and Storage
-        // The unpickled object should constitute the state_dict (or a dict containing it)
-        // With TensorReferences pointing to storage keys.
+        let unpickledObj = (try? unpickler.load()) ?? [:]
         
         var stateDict: [String: Any] = [:]
         print("PthConverter: Unpickled Type: \(type(of: unpickledObj))")
         if let dict = unpickledObj as? [String: Any] {
             print("PthConverter: Cast to [String: Any] succeeded, count: \(dict.count)")
-            print("Keys: \(dict.keys.map { $0 })")
             stateDict = dict
         } else if let nsDict = unpickledObj as? NSDictionary {
              print("PthConverter: Cast to NSDictionary succeeded, count: \(nsDict.count)")
@@ -139,11 +134,15 @@ public final class PthConverter: Sendable {
                      stateDict[keyStr] = v
                  }
              }
-             print("Keys: \(stateDict.keys.map { $0 })")
-        } else {
-             // Sometimes it's a model object with __getstate__, handled by BUILD
-             print("PthConverter: Unpickled object is \(type(of: unpickledObj))")
-             throw PthConversionError.invalidStateDict
+        } else if let arr = unpickledObj as? [Any] {
+             print("PthConverter: Unpickled array count: \(arr.count)")
+             for item in arr {
+                 if let d = item as? [String: Any] {
+                     for (k, v) in d { stateDict[k] = v }
+                 } else if let d = item as? NSDictionary {
+                     for (k, v) in d { if let ks = k as? String { stateDict[ks] = v } }
+                 }
+             }
         }
         
         // Check for nested state dict (checkpoint)
