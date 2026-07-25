@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Sheet for managing imported voice models.
+/// Sheet for managing imported voice models & auto-organizing directory files.
 struct ModelManagerView: View {
     @Binding var isPresented: Bool
     @State private var models: [String] = []
+    @State private var statusMessage: String? = nil
     var onModelDeleted: (String) -> Void
 
     @AppStorage("accentTheme") private var accentTheme: AccentTheme = .system
@@ -32,31 +33,47 @@ struct ModelManagerView: View {
                 .ignoresSafeArea()
 
                 GlassEffectContainer {
-                    if models.isEmpty {
-                        VStack {
-                            Image(systemName: "cube.transparent")
-                                .font(.system(size: 50))
-                                .foregroundStyle(.secondary)
-                            Text("No imported models")
-                                .foregroundStyle(.primary.opacity(0.7))
+                    VStack {
+                        if let statusMessage = statusMessage {
+                            Text(statusMessage)
+                                .font(.caption)
+                                .foregroundStyle(accentColor)
+                                .padding(.top, 8)
                         }
-                    } else {
-                        List {
-                            ForEach(models, id: \.self) { model in
-                                Text(model)
-                                    .foregroundStyle(.primary)
-                                    .listRowBackground(Color.clear)
-                                    .listRowSeparatorTint(.primary.opacity(0.2))
+
+                        if models.isEmpty {
+                            VStack {
+                                Image(systemName: "cube.transparent")
+                                    .font(.system(size: 50))
+                                    .foregroundStyle(.secondary)
+                                Text("No imported models")
+                                    .foregroundStyle(.primary.opacity(0.7))
                             }
-                            .onDelete(perform: deleteModel)
+                            .frame(maxHeight: .infinity)
+                        } else {
+                            List {
+                                ForEach(models, id: \.self) { model in
+                                    Text(model)
+                                        .foregroundStyle(.primary)
+                                        .listRowBackground(Color.clear)
+                                        .listRowSeparatorTint(.primary.opacity(0.2))
+                                }
+                                .onDelete(perform: deleteModel)
+                            }
+                            .scrollContentBackground(.hidden)
                         }
-                        .scrollContentBackground(.hidden)
                     }
                 }
             }
             .navigationTitle("Manage Models")
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: autoOrganize) {
+                        Label("Organize", systemImage: "sparkles")
+                    }
+                    .foregroundStyle(accentColor)
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { isPresented = false }
                         .foregroundStyle(accentColor)
@@ -70,10 +87,51 @@ struct ModelManagerView: View {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         guard let files = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
 
+        let systemModels = ["hubert", "hubert_base", "rmvpe", "rmvpe_mlx", "crepe", "crepe_tiny"]
         models = files
             .filter { $0.pathExtension == "safetensors" || $0.pathExtension == "npz" }
             .map { $0.deletingPathExtension().lastPathComponent }
+            .filter { name in
+                !name.hasPrefix(".") && !systemModels.contains(name.lowercased())
+            }
             .sorted()
+    }
+
+    func autoOrganize() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let fileManager = FileManager.default
+
+        // Create organized subdirectories
+        let modelsDir = docs.appendingPathComponent("models", isDirectory: true)
+        let indicesDir = docs.appendingPathComponent("indices", isDirectory: true)
+        let logsDir = docs.appendingPathComponent("logs", isDirectory: true)
+
+        try? fileManager.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: indicesDir, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true)
+
+        guard let files = try? fileManager.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
+
+        var organizedCount = 0
+        for file in files {
+            let ext = file.pathExtension.lowercased()
+            let name = file.deletingPathExtension().lastPathComponent.lowercased()
+
+            if ext == "index" {
+                let dest = indicesDir.appendingPathComponent(file.lastPathComponent)
+                if file != dest {
+                    try? fileManager.removeItem(at: dest)
+                    try? fileManager.moveItem(at: file, to: dest)
+                    organizedCount += 1
+                }
+            } else if ext == "tmp" || ext == "bak" {
+                try? fileManager.removeItem(at: file)
+                organizedCount += 1
+            }
+        }
+
+        statusMessage = "Organized \(organizedCount) files successfully!"
+        loadModels()
     }
 
     func deleteModel(at offsets: IndexSet) {

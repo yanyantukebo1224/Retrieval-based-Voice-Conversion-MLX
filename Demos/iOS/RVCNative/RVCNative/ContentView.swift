@@ -596,15 +596,86 @@ struct ContentView: View {
         print("DEBUG: \(message)")
     }
 
+    func scanAndAutoClassifyDocuments() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let files = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
+        
+        for file in files {
+            let nameLower = file.deletingPathExtension().lastPathComponent.lowercased()
+            let extLower = file.pathExtension.lowercased()
+            
+            // HuBERT モデルの自動識別
+            if (nameLower.contains("hubert") || nameLower == "hubert_base") && extLower != "log" {
+                let dest = docs.appendingPathComponent("hubert_base.safetensors")
+                if file != dest {
+                    if extLower == "pth" || extLower == "pt" {
+                        if let arrays = try? PthConverter.shared.convert(url: file) {
+                            try? MLX.save(arrays: arrays, url: dest)
+                            log("Auto-converted HuBERT model to \(dest.lastPathComponent)")
+                        }
+                    } else if extLower == "safetensors" || extLower == "npz" {
+                        try? FileManager.default.removeItem(at: dest)
+                        try? FileManager.default.copyItem(at: file, to: dest)
+                        log("Auto-classified HuBERT model: \(file.lastPathComponent) -> \(dest.lastPathComponent)")
+                    }
+                }
+            }
+            
+            // RMVPE モデルの自動識別
+            if nameLower.contains("rmvpe") && extLower != "log" {
+                let dest = docs.appendingPathComponent("rmvpe.safetensors")
+                if file != dest {
+                    if extLower == "pth" || extLower == "pt" {
+                        if let arrays = try? PthConverter.shared.convert(url: file) {
+                            try? MLX.save(arrays: arrays, url: dest)
+                            log("Auto-converted RMVPE model to \(dest.lastPathComponent)")
+                        }
+                    } else if extLower == "safetensors" || extLower == "npz" {
+                        try? FileManager.default.removeItem(at: dest)
+                        try? FileManager.default.copyItem(at: file, to: dest)
+                        log("Auto-classified RMVPE model: \(file.lastPathComponent) -> \(dest.lastPathComponent)")
+                    }
+                }
+            }
+        }
+    }
+
     func refreshImportedModels() {
+        scanAndAutoClassifyDocuments()
+        
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         guard let files = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
 
+        let systemModelNames = ["hubert", "hubert_base", "rmvpe", "rmvpe_mlx", "crepe", "crepe_tiny"]
         importedModels = files
             .filter { $0.pathExtension == "safetensors" || $0.pathExtension == "npz" }
             .map { $0.deletingPathExtension().lastPathComponent }
-            .filter { !$0.hasPrefix(".") }
+            .filter { name in
+                !name.hasPrefix(".") && !systemModelNames.contains(name.lowercased())
+            }
             .sorted()
+    }
+
+    func findSystemModelURL(name: String, extensions: [String]) -> URL? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let searchDirs = [docs, docs.appendingPathComponent("models")]
+        
+        for dir in searchDirs {
+            for ext in extensions {
+                let candidate = dir.appendingPathComponent("\(name).\(ext)")
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    return candidate
+                }
+            }
+        }
+        
+        for ext in extensions {
+            if let url = RVCInference.bundle.url(forResource: name, withExtension: ext)
+                ?? RVCInference.bundle.url(forResource: name, withExtension: ext, subdirectory: "Assets") {
+                return url
+            }
+        }
+        return nil
     }
 
     func loadModel(name: String, isImported: Bool = false) {
@@ -619,7 +690,6 @@ struct ContentView: View {
             "Slim Shady": "Slim_Shady_New"
         ]
 
-        // Map name to file - use mapping for bundled, or convert name for imported
         let filename: String
         if let mappedName = bundledModelMapping[name], !isImported {
             filename = mappedName
@@ -642,27 +712,28 @@ struct ContentView: View {
 
         guard let url = modelUrl else {
             log("Failed to find model file: \(filename).safetensors")
-            statusMessage = "Model \(name) not found in bundle"
+            statusMessage = "Model \(name) not found in bundle or Documents"
             return
         }
         log("Found model at \(url.path)")
 
-        let hubertUrl = RVCInference.bundle.url(forResource: "hubert_base", withExtension: "safetensors")
-            ?? RVCInference.bundle.url(forResource: "hubert_base", withExtension: "safetensors", subdirectory: "Assets")
+        // マルチパス検索で HuBERT を確実に発見
+        let hubertUrl = findSystemModelURL(name: "hubert_base", extensions: ["safetensors", "npz", "pt", "pth"])
+            ?? findSystemModelURL(name: "hubert", extensions: ["safetensors", "npz", "pt", "pth"])
 
         guard let hubertURL = hubertUrl else {
-            log("Failed to find hubert_base.safetensors")
-            statusMessage = "Hubert model not found!"
+            log("Failed to find hubert_base.safetensors in Documents or Bundle")
+            statusMessage = "HuBERT model missing! Please import hubert_base.safetensors"
+            alertTitle = "Model Missing"
+            alertMessage = "HuBERT base model (hubert_base.safetensors) is required for inference. Please import it via Import New."
+            showAlert = true
             return
         }
+        log("Found HuBERT model at \(hubertURL.path)")
 
-        // Optional RMVPE
-        let rmvpeURL = RVCInference.bundle.url(forResource: "rmvpe", withExtension: "safetensors")
-            ?? RVCInference.bundle.url(forResource: "rmvpe", withExtension: "safetensors", subdirectory: "Assets")
-            ?? RVCInference.bundle.url(forResource: "rmvpe", withExtension: "npz")
-            ?? RVCInference.bundle.url(forResource: "rmvpe", withExtension: "npz", subdirectory: "Assets")
-            ?? RVCInference.bundle.url(forResource: "rmvpe_mlx", withExtension: "npz")
-            ?? RVCInference.bundle.url(forResource: "rmvpe_mlx", withExtension: "npz", subdirectory: "Assets")
+        // マルチパス検索で RMVPE を自動検索
+        let rmvpeURL = findSystemModelURL(name: "rmvpe", extensions: ["safetensors", "npz", "pt", "pth"])
+            ?? findSystemModelURL(name: "rmvpe_mlx", extensions: ["safetensors", "npz"])
 
         // Search for matching index file (for imported models)
         var indexUrl: URL? = nil
