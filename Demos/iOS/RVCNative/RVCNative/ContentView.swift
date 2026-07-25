@@ -654,6 +654,7 @@ struct ContentView: View {
                     }
                 } else {
                     log("Documents/rmvpe.safetensors already exists and protected.")
+                }
             }
         }
     }
