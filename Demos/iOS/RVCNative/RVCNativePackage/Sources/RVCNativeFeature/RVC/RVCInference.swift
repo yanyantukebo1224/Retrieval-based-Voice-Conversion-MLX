@@ -812,22 +812,45 @@ import MLXNN
             log("DEBUG: Aligned phone shape: \(phone.shape), f0 shape: \(f0.shape)")
 
             // 5. Optional FAISS Index Retrieval
-            if indexRate > 0, let indexReader = indexReader {
-                do {
-                    phone = try indexReader.retrieve(phone: phone, indexRate: indexRate)
-                    log("DEBUG: FAISS Index retrieval completed.")
-                } catch {
-                    log("WARN: FAISS Index retrieval failed (skipping index): \(error.localizedDescription)")
-                }
+            if indexRate > 0, let indexManager = indexManager {
+                phone = indexManager.search(features: phone, indexRate: indexRate)
+                log("DEBUG: FAISS Index retrieval completed with rate \(indexRate)")
             }
 
-            // 6. Synthesizer Inference
+            // 6. Pitch Quantization & Synthesizer Inference
             guard let synth = synthesizer else {
                 throw NSError(domain: "RVCInference", code: 2, userInfo: [NSLocalizedDescriptionKey: "Voice model not loaded in Synthesizer"])
             }
 
+            // Compute coarse pitch buckets (Hz -> Bucket 1-255)
+            var f0Hz = f0.squeezed(axes: [2]) // [1, minLen]
+            if pitchShift != 0 {
+                let multiplier = pow(2.0, Float(pitchShift) / 12.0)
+                f0Hz = f0Hz * multiplier
+            }
+            let f0_min: Float = 50.0
+            let f0_max: Float = 1100.0
+            let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
+            let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
+            let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
+            var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
+            pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
+            pitch = MLX.maximum(pitch, 1.0)
+            pitch = MLX.minimum(pitch, 255.0)
+            let pitchBuckets = pitch.asType(Int32.self)
+            
+            let nsff0 = f0Hz.expandedDimensions(axis: 2)
+            let phoneLengths = MLXArray([Int32(minLen)])
+            let sid = MLXArray([Int32(0)])
+
             let audioConverted: MLXArray = try autoreleasepool {
-                let out = try synth.infer(phone: phone, f0: f0, pitchShift: pitchShift)
+                let out = synth.infer(
+                    phone: phone,
+                    phoneLengths: phoneLengths,
+                    pitch: pitchBuckets,
+                    nsff0: nsff0,
+                    sid: sid
+                )
                 MLX.eval(out)
                 return out
             }
