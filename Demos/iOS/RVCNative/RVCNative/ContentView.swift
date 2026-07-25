@@ -605,56 +605,64 @@ struct ContentView: View {
 
     func scanAndAutoClassifyDocuments() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        guard let files = try? FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
+        let fileManager = FileManager.default
+        guard let files = try? fileManager.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) else { return }
+        
+        let hubertDest = docs.appendingPathComponent("hubert_base.safetensors")
+        let rmvpeDest = docs.appendingPathComponent("rmvpe.safetensors")
         
         for file in files {
             let nameLower = file.deletingPathExtension().lastPathComponent.lowercased()
             let extLower = file.pathExtension.lowercased()
             
-            // HuBERT モデルの自動識別
+            // 1. HuBERT モデルの自働識別 & 完全保存保護
             if (nameLower.contains("hubert") || nameLower == "hubert_base") && extLower != "log" {
-                let dest = docs.appendingPathComponent("hubert_base.safetensors")
-                if file != dest {
-                    if extLower == "pth" || extLower == "pt" {
+                if !fileManager.fileExists(atPath: hubertDest.path) {
+                    if extLower == "safetensors" || extLower == "npz" {
+                        try? fileManager.copyItem(at: file, to: hubertDest)
+                        log("Auto-classified HuBERT model to Documents/hubert_base.safetensors")
+                    } else if extLower == "pth" || extLower == "pt" {
                         if let arrays = try? PthConverter.shared.convert(url: file) {
-                            try? MLX.save(arrays: arrays, url: dest)
-                            try? FileManager.default.removeItem(at: file)
-                            log("Auto-converted HuBERT model to \(dest.lastPathComponent) and removed source \(file.lastPathComponent)")
+                            if (try? MLX.save(arrays: arrays, url: hubertDest)) != nil {
+                                try? fileManager.removeItem(at: file)
+                                log("Auto-converted HuBERT model to Documents/hubert_base.safetensors and removed source")
+                            }
                         }
-                    } else if extLower == "safetensors" || extLower == "npz" {
-                        try? FileManager.default.removeItem(at: dest)
-                        try? FileManager.default.copyItem(at: file, to: dest)
-                        log("Auto-classified HuBERT model: \(file.lastPathComponent) -> \(dest.lastPathComponent)")
                     }
+                } else {
+                    log("Documents/hubert_base.safetensors already exists and protected.")
                 }
             }
             
-            // RMVPE モデルの自動識別
+            // 2. RMVPE モデルの自働識別 & 完全保存保護
             else if nameLower.contains("rmvpe") && extLower != "log" {
-                let dest = docs.appendingPathComponent("rmvpe.safetensors")
-                if file != dest {
-                    if extLower == "pth" || extLower == "pt" {
+                if !fileManager.fileExists(atPath: rmvpeDest.path) {
+                    if extLower == "safetensors" || extLower == "npz" {
+                        try? fileManager.copyItem(at: file, to: rmvpeDest)
+                        log("Auto-classified RMVPE model to Documents/rmvpe.safetensors")
+                    } else if extLower == "pth" || extLower == "pt" {
                         if let arrays = try? PthConverter.shared.convert(url: file) {
-                            try? MLX.save(arrays: arrays, url: dest)
-                            try? FileManager.default.removeItem(at: file)
-                            log("Auto-converted RMVPE model to \(dest.lastPathComponent) and removed source \(file.lastPathComponent)")
+                            if (try? MLX.save(arrays: arrays, url: rmvpeDest)) != nil {
+                                try? fileManager.removeItem(at: file)
+                                log("Auto-converted RMVPE model to Documents/rmvpe.safetensors and removed source")
+                            }
                         }
-                    } else if extLower == "safetensors" || extLower == "npz" {
-                        try? FileManager.default.removeItem(at: dest)
-                        try? FileManager.default.copyItem(at: file, to: dest)
-                        log("Auto-classified RMVPE model: \(file.lastPathComponent) -> \(dest.lastPathComponent)")
                     }
+                } else {
+                    log("Documents/rmvpe.safetensors already exists and protected.")
                 }
             }
             
-            // 一般の RVC ボイスモデル (.pth / .pt / .zip) の自動変換と元ファイル削除 (.index は厳重保護)
+            // 3. 一般の RVC ボイスモデル (.pth / .pt / .zip) の自動変換と元ファイル削除 (.index は厳重保護)
             else if (extLower == "pth" || extLower == "pt" || extLower == "zip") && !nameLower.hasPrefix(".") {
                 let modelName = file.deletingPathExtension().lastPathComponent
                 let dest = docs.appendingPathComponent("\(modelName).safetensors")
-                if let arrays = try? PthConverter.shared.convert(url: file, copyIndexTo: docs) {
-                    if (try? MLX.save(arrays: arrays, url: dest)) != nil {
-                        try? FileManager.default.removeItem(at: file)
-                        log("Auto-converted voice model: \(file.lastPathComponent) -> \(dest.lastPathComponent) and removed source file.")
+                if !fileManager.fileExists(atPath: dest.path) {
+                    if let arrays = try? PthConverter.shared.convert(url: file, copyIndexTo: docs) {
+                        if (try? MLX.save(arrays: arrays, url: dest)) != nil {
+                            try? fileManager.removeItem(at: file)
+                            log("Auto-converted voice model: \(file.lastPathComponent) -> \(dest.lastPathComponent) and removed source file.")
+                        }
                     }
                 }
             }
