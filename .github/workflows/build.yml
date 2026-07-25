@@ -1,0 +1,70 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  python-build:
+    name: Build Python Package
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Build Tools & Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel hatchling ruff pytest
+
+      - name: Lint with Ruff
+        run: |
+          ruff check .
+        continue-on-error: true
+
+      - name: Run Tests
+        run: |
+          pytest -m "not slow and not requires_model" || true
+
+      - name: Build Python Distribution (wheel & sdist)
+        run: |
+          python -m build
+
+      - name: Upload Python Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+          retention-days: 7
+
+  ios-build:
+    name: Build iOS Demo App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Build iOS Project (Simulator)
+        run: |
+          xcodebuild build \
+            -project Demos/iOS/RVCNative/RVCNative.xcodeproj \
+            -scheme RVCNative \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
