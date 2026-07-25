@@ -447,15 +447,12 @@ struct ContentView: View {
     }
 
     func handleFileImportURL(url selectedFile: URL) {
-        guard selectedFile.startAccessingSecurityScopedResource() else {
-            log("Failed to access file: \(selectedFile.lastPathComponent)")
-            alertTitle = "Access Denied"
-            alertMessage = "Could not access the selected file"
-            showAlert = true
-            return
+        let isSecurityScoped = selectedFile.startAccessingSecurityScopedResource()
+        defer {
+            if isSecurityScoped {
+                selectedFile.stopAccessingSecurityScopedResource()
+            }
         }
-
-        defer { selectedFile.stopAccessingSecurityScopedResource() }
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let filename = selectedFile.lastPathComponent
@@ -569,12 +566,12 @@ struct ContentView: View {
     }
 
     func handleAudioFileImportURL(url selectedFile: URL) {
-        guard selectedFile.startAccessingSecurityScopedResource() else {
-            log("Failed to access audio file")
-            return
+        let isSecurityScoped = selectedFile.startAccessingSecurityScopedResource()
+        defer {
+            if isSecurityScoped {
+                selectedFile.stopAccessingSecurityScopedResource()
+            }
         }
-
-        defer { selectedFile.stopAccessingSecurityScopedResource() }
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let destURL = docs.appendingPathComponent(selectedFile.lastPathComponent)
