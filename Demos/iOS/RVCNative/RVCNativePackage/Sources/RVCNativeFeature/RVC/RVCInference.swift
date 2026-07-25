@@ -80,7 +80,9 @@ public class RVCInference: ObservableObject {
 
         DispatchQueue.main.async { self.status = "Loading models..." }
         
+        // ==========================================
         // 1. Load Hubert
+        // ==========================================
         log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
         var actualHubertURL = hubertURL
         let hExt = hubertURL.pathExtension.lowercased()
@@ -96,20 +98,17 @@ public class RVCInference: ObservableObject {
         }
         
         let hubertWeights = try MLX.loadArrays(url: actualHubertURL)
-        log("RVCInference: Raw HuBERT file keys count: \(hubertWeights.count), sample keys: \(Array(hubertWeights.keys.prefix(10)))")
+        log("RVCInference: Raw HuBERT file keys count: \(hubertWeights.count)")
 
         self.hubertModel = HubertModel(config: HubertConfig())
         var newParams: [String: MLXArray] = [:]
         for (k, v) in hubertWeights {
             var newKey = k
-            let val = v
+            var val = v
             
             while newKey.hasPrefix("model.") || newKey.hasPrefix("hubert.") {
-                if newKey.hasPrefix("model.") {
-                    newKey = String(newKey.dropFirst(6))
-                } else if newKey.hasPrefix("hubert.") {
-                    newKey = String(newKey.dropFirst(7))
-                }
+                if newKey.hasPrefix("model.") { newKey = String(newKey.dropFirst(6)) }
+                else if newKey.hasPrefix("hubert.") { newKey = String(newKey.dropFirst(7)) }
             }
 
             if newKey.hasPrefix("encoder.layers.") {
@@ -123,18 +122,17 @@ public class RVCInference: ObservableObject {
                 let parts = newKey.components(separatedBy: ".")
                 if parts.count >= 3, let idx = Int(parts[2]) {
                     let subPath = parts.dropFirst(3).joined(separator: ".")
-                    if subPath == "0.weight" {
-                        newKey = "feature_extractor.l\(idx).conv.weight"
-                    } else if subPath == "0.bias" {
-                        newKey = "feature_extractor.l\(idx).conv.bias"
-                    } else if subPath == "2.weight" || subPath == "1.weight" {
-                        newKey = "feature_extractor.l\(idx).layer_norm.weight"
-                    } else if subPath == "2.bias" || subPath == "1.bias" {
-                        newKey = "feature_extractor.l\(idx).layer_norm.bias"
-                    } else {
-                        newKey = "feature_extractor.l\(idx)." + subPath
-                    }
+                    if subPath == "0.weight" { newKey = "feature_extractor.l\(idx).conv.weight" }
+                    else if subPath == "0.bias" { newKey = "feature_extractor.l\(idx).conv.bias" }
+                    else if subPath == "2.weight" || subPath == "1.weight" { newKey = "feature_extractor.l\(idx).layer_norm.weight" }
+                    else if subPath == "2.bias" || subPath == "1.bias" { newKey = "feature_extractor.l\(idx).layer_norm.bias" }
+                    else { newKey = "feature_extractor.l\(idx)." + subPath }
                 }
+            }
+            
+            // Hubert Conv1d transpose: PyTorch [Out, In, K] -> MLX [Out, K, In]
+            if newKey.hasSuffix(".weight") && val.ndim == 3 {
+                val = val.transposed(axes: [0, 2, 1])
             }
             
             newParams[newKey] = val
@@ -172,7 +170,9 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
         }
         
+        // ==========================================
         // 2. Load Synthesizer (Main Voice Model)
+        // ==========================================
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
         let modelWeights = try MLX.loadArrays(url: modelURL)
 
@@ -224,7 +224,7 @@ public class RVCInference: ObservableObject {
         var synthParams: [String: MLXArray] = [:]
         for (k, v) in modelWeights {
             var newK = k
-            let newV = v
+            var newV = v
 
             if newK.contains("dec.ups.") { newK = newK.replacingOccurrences(of: "dec.ups.", with: "dec.up_") }
             if newK.contains("dec.noise_convs.") { newK = newK.replacingOccurrences(of: "dec.noise_convs.", with: "dec.noise_conv_") }
@@ -257,7 +257,58 @@ public class RVCInference: ObservableObject {
                 else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
+            // Synthesizer Conv transpose logic
+            if newK.hasSuffix(".weight") && newV.ndim == 3 {
+                if newK.contains(".up_") || newK.contains(".ups.") {
+                    newV = newV.transposed(axes: [1, 2, 0]) // ConvTranspose1d: [In, Out, K] -> [Out, K, In]
+                } else {
+                    newV = newV.transposed(axes: [0, 2, 1]) // Conv1d: [Out, In, K] -> [Out, K, In]
+                }
+            }
+
             synthParams[newK] = newV
+        }
+
+        // Weight Norm Fusion for Synthesizer
+        for i in 0..<4 {
+            let gKey = "dec.up_\(i).weight_g"
+            let vKey = "dec.up_\(i).weight_v"
+            let outKey = "dec.up_\(i).weight"
+            
+            if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
+                let v_sqr = weight_v * weight_v
+                let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true) // PyTorch ConvTranspose1d uses dim=1 for Out
+                let v_norm = sqrt(v_sum + 1e-12)
+                let weight_normalized = weight_v / v_norm
+                let weight_fused = weight_g * weight_normalized
+                
+                synthParams[outKey] = weight_fused.transposed(axes: [1, 2, 0])
+                synthParams.removeValue(forKey: gKey)
+                synthParams.removeValue(forKey: vKey)
+            }
+        }
+        
+        for i in 0..<12 {
+            for (convPrefix, convCount) in [("c1_", 3), ("c2_", 3)] {
+                for j in 0..<convCount {
+                    let base = "dec.resblock_\(i).\(convPrefix)\(j)"
+                    let gKey = "\(base).weight_g"
+                    let vKey = "\(base).weight_v"
+                    let outKey = "\(base).conv.weight"
+                    
+                    if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
+                        let v_sqr = weight_v * weight_v
+                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true) // PyTorch Conv1d uses dim=0 for Out
+                        let v_norm = sqrt(v_sum + 1e-12)
+                        let weight_normalized = weight_v / v_norm
+                        let weight_fused = weight_g * weight_normalized
+                        
+                        synthParams[outKey] = weight_fused.transposed(axes: [0, 2, 1])
+                        synthParams.removeValue(forKey: gKey)
+                        synthParams.removeValue(forKey: vKey)
+                    }
+                }
+            }
         }
 
         do {
@@ -267,7 +318,9 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Error updating Synthesizer: \(error)")
         }
         
+        // ==========================================
         // 3. Load RMVPE
+        // ==========================================
         if let rmvpeURL = rmvpeURL {
             do {
                 let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
