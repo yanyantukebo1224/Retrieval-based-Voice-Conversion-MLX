@@ -105,6 +105,7 @@ import MLXNN
             var newParams: [String: MLXArray] = [:]
             for (k, v) in hubertWeights {
                 var newKey = k
+                var val = v
                 
                 // Remap encoder.layers.X to encoder.lX (Swift model uses l0, l1, etc.)
                 if newKey.hasPrefix("encoder.layers.") {
@@ -121,8 +122,13 @@ import MLXNN
                         newKey = "feature_extractor.l\(idx)." + parts.dropFirst(3).joined(separator: ".")
                     }
                 }
+
+                // Fix Conv1d weight shape: PyTorch [Out, In, K] -> MLX [Out, K, In]
+                if newKey.contains("feature_extractor") && newKey.hasSuffix(".conv.weight") && val.ndim == 3 {
+                    val = val.transposed(axes: [0, 2, 1])
+                }
                 
-                newParams[newKey] = v
+                newParams[newKey] = val
             }
             
             // Fix HuBERT PosConv Weight Norm
@@ -154,7 +160,13 @@ import MLXNN
             }
             log("RVCInference: Loaded \(newParams.count) HuBERT weights")
             log("RVCInference: HuBERT sample keys: \(Array(newParams.keys.prefix(5)))")
-            self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
+            
+            do {
+                self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
+                log("RVCInference: HuBERT parameters successfully updated.")
+            } catch {
+                log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
+            }
             
             // 2. Load Synthesizer (TextEncoder + Flow + Generator)
             log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
@@ -446,9 +458,13 @@ import MLXNN
                 log("DEBUG: synthParams[dec.m_source.l_linear.bias] NOT FOUND - NSF will use init bias!")
             }
 
-            self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
-            self.synthesizer?.train(false)  // CRITICAL: Set to eval mode (disables Dropout, uses BatchNorm running stats)
-            log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
+            do {
+                self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
+                self.synthesizer?.train(false)
+                log("RVCInference: Successfully loaded Synthesizer with \(synthParams.count) weight keys")
+            } catch {
+                log("RVCInference: ⚠️ Error updating Synthesizer parameters: \(error)")
+            }
 
             // DEBUG: Verify weights are loaded correctly
             if let synth = self.synthesizer {
@@ -571,7 +587,12 @@ import MLXNN
                         log("RVCInference: encoder.bn.runningVar value: \(rvKey.asArray(Float.self))")
                     }
 
-                    self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
+                    do {
+                        self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
+                        log("RVCInference: RMVPE parameters successfully updated.")
+                    } catch {
+                        log("RVCInference: ⚠️ Error updating RMVPE parameters: \(error)")
+                    }
                     self.rmvpe?.setTrainingMode(false)  // CRITICAL: Set to eval mode for correct inference
 
                     log("RVCInference: ✅ RMVPE loaded with CustomBatchNorm (\(remappedRMVPE.count) keys)")
