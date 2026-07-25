@@ -14,19 +14,35 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install torch safetensors requests
+          pip install torch safetensors requests numpy
 
       - name: Download and Convert
         run: |
           python -c "
-          import torch, os
+          import sys, types, torch, os
           from safetensors.torch import save_file
+
+          # fairseq のクラス参照エラーを回避するダミーモジュール
+          class Dummy:
+              def __init__(self, *args, **kwargs): pass
+
+          class DummyModule(types.ModuleType):
+              def __getattr__(self, name):
+                  return Dummy
+
+          for mod in ['fairseq', 'fairseq.data', 'fairseq.data.dictionary', 'fairseq.models', 'fairseq.tasks', 'fairseq.models.hubert']:
+              sys.modules[mod] = DummyModule(mod)
 
           def convert(url, out_name):
               print(f'Downloading {url}...')
               os.system(f'curl -L {url} -o temp.pt')
               ckpt = torch.load('temp.pt', map_location='cpu', weights_only=False)
-              sd = ckpt.get('model', ckpt.get('state_dict', ckpt))
+              
+              if isinstance(ckpt, dict):
+                  sd = ckpt.get('model', ckpt.get('state_dict', ckpt))
+              else:
+                  sd = getattr(ckpt, 'state_dict', lambda: ckpt)()
+                  
               clean_sd = {k: v.contiguous() for k, v in sd.items() if isinstance(v, torch.Tensor)}
               save_file(clean_sd, out_name)
               os.remove('temp.pt')
