@@ -48,7 +48,7 @@ jobs:
           retention-days: 7
 
   ios-build:
-    name: Build iOS Demo App
+    name: Build Unsigned iOS IPA
     runs-on: macos-latest
 
     steps:
@@ -65,7 +65,7 @@ jobs:
             sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Demos/iOS/RVCNative/RVCNativePackage/Package.swift
           fi
 
-      - name: Setup Submodules & Checkout Stable mlx-swift
+      - name: Setup Submodules & Fix mlx-swift Compatibility
         run: |
           cd Demos/iOS/RVCNative/Vendor
           rm -rf mlx-swift
@@ -76,6 +76,8 @@ jobs:
           if [ -f "Package.swift" ]; then
             sed -i '' '1s/.*/\/\/ swift-tools-version: 6.0/' Package.swift
           fi
+          # Fix C++ std::allocator does not support const types error in custom_kernel.cpp
+          find Source -name "custom_kernel.cpp" -exec sed -i '' 's/std::vector<const array>/std::vector<array>/g' {} + || true
 
       - name: Resolve Package Dependencies
         run: |
@@ -83,13 +85,30 @@ jobs:
             -workspace Demos/iOS/RVCNative/RVCNative.xcworkspace \
             -scheme RVCNative
 
-      - name: Build iOS Project (Simulator)
+      - name: Build Unsigned iOS App
         run: |
+          cd Demos/iOS/RVCNative
           xcodebuild build \
-            -workspace Demos/iOS/RVCNative/RVCNative.xcworkspace \
+            -workspace RVCNative.xcworkspace \
             -scheme RVCNative \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ./build \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Unsigned IPA
+        run: |
+          cd Demos/iOS/RVCNative
+          mkdir -p build/Payload
+          cp -r build/Build/Products/Release-iphoneos/RVCNative.app build/Payload/
+          cd build
+          zip -qr RVCNative_unsigned.ipa Payload
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RVCNative_unsigned_ipa
+          path: Demos/iOS/RVCNative/build/RVCNative_unsigned.ipa
+          retention-days: 7
