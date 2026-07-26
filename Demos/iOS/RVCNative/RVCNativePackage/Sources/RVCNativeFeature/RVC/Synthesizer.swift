@@ -3,12 +3,7 @@ import MLX
 import MLXNN
 import MLXRandom
 
-/// RVC Synthesizer Implementation for iOS
-///
-/// CRITICAL FIXES APPLIED:
-/// - ResidualCouplingLayer: Added MLX.clip to logs before exp() to prevent float32 overflow (10^38 explosion).
-/// - ResidualCouplingBlock: Added MLX.eval(h) after memory striding to avoid non-contiguous tensor layout crashes/corruption in Conv1d.
-/// - TextEncoder: Fixed dimension format matching Python (B, C, T).
+/// RVC Synthesizer Implementation for iOS (MLX Native Shape: B, T, C)
 
 // MARK: - Utility Functions
 
@@ -183,6 +178,7 @@ class TextEncoder: Module {
     }
     
     func callAsFunction(_ phone: MLXArray, pitch: MLXArray?, lengths: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        // phone: (B, T, EmbDim)
         var x = emb_phone(phone)
         
         if let pitch = pitch, let embPitch = emb_pitch {
@@ -194,20 +190,19 @@ class TextEncoder: Module {
         x = leakyRelu(x, negativeSlope: 0.1)
         
         let xMask = sequenceMask(lengths: lengths, maxLength: x.shape[1])
-        let xMaskExpanded = xMask.expandedDimensions(axis: -1)  // (B, L, 1)
+        let xMaskExpanded = xMask.expandedDimensions(axis: -1)  // (B, T, 1)
         
         x = encoder(x, xMask: xMaskExpanded)
 
+        // MLX Standard: proj outputs (B, T, outChannels * 2)
         let stats = proj(x) * xMaskExpanded
-        let statsTransposed = stats.transposed(0, 2, 1)  // (B, L, C*2) -> (B, C*2, L)
 
+        // 🚨【最重要修正】次元を転置せず、Channel軸(最後のアシス)で2分割する (B, T, C)
         let splitIdx = outChannels
-        let m = statsTransposed[0..., 0..<splitIdx, 0...]  // (B, C, L)
-        let logs = statsTransposed[0..., splitIdx..., 0...]  // (B, C, L)
+        let m = stats[0..., 0..., 0..<splitIdx]         // (B, T, C)
+        let logs = stats[0..., 0..., splitIdx...]       // (B, T, C)
 
-        let xMaskOut = xMask.expandedDimensions(axis: 1)  // (B, L) -> (B, 1, L)
-
-        return (m, logs, xMaskOut)
+        return (m, logs, xMaskExpanded)
     }
 }
 
@@ -315,6 +310,7 @@ class ResidualCouplingLayer: Module {
     }
     
     func callAsFunction(_ x: MLXArray, xMask: MLXArray, g: MLXArray?, reverse: Bool = false) -> MLXArray {
+        // x: (B, T, C)
         let x0 = x[0..., 0..., 0..<halfChannels]
         var x1 = x[0..., 0..., halfChannels...]
         
@@ -333,7 +329,6 @@ class ResidualCouplingLayer: Module {
             logs = stats[0..., 0..., halfChannels...]
         }
         
-        // 🚨【最重要修正】指数関数の数値爆発 (10^38) を防止するためにクランプを追加
         let clampedLogs = MLX.clip(logs, min: -9.0, max: 9.0)
         
         if !reverse {
@@ -376,12 +371,12 @@ class ResidualCouplingBlock: Module {
             for i in 0..<nFlows {
                 h = flows[i](h, xMask: xMask, g: g, reverse: false)
                 h = h[0..., 0..., .stride(by: -1)]
-                MLX.eval(h) // 🚨【修正】メモリレイアウト不連続によるクラッシュ防止
+                MLX.eval(h)
             }
         } else {
             for i in (0..<nFlows).reversed() {
                 h = h[0..., 0..., .stride(by: -1)]
-                MLX.eval(h) // 🚨【修正】メモリレイアウト不連続によるクラッシュ防止
+                MLX.eval(h)
                 h = flows[i](h, xMask: xMask, g: g, reverse: true)
             }
         }
@@ -449,19 +444,16 @@ public class Synthesizer: Module {
     public func infer(phone: MLXArray, phoneLengths: MLXArray, pitch: MLXArray?, nsff0: MLXArray?, sid: MLXArray) -> MLXArray {
         let g = emb_g(sid).expandedDimensions(axis: 1)
         
+        // m_p, logs_p, xMask are all in (B, T, C) format
         let (m_p, logs_p, xMask) = enc_p(phone, pitch: pitch, lengths: phoneLengths)
         
-        // 🚨【修正】logs_p をクランプし、決定的な潜在変数を安定生成
         let clampedLogsP = MLX.clip(logs_p, min: -9.0, max: 9.0)
         let z_p = (m_p + exp(clampedLogsP) * MLXRandom.normal(m_p.shape).asType(m_p.dtype) * 0.0) * xMask
 
-        let z_p_transposed = z_p.transposed(0, 2, 1)  // (B, C, T) -> (B, T, C)
-        let xMask_transposed = xMask.transposed(0, 2, 1)  // (B, 1, T) -> (B, T, 1)
+        // Flow Pass (Input and Output remain in (B, T, C))
+        let z = flow(z_p, xMask: xMask, g: g, reverse: true)
 
-        let z_mlx = flow(z_p_transposed, xMask: xMask_transposed, g: g, reverse: true)
-
-        let z = z_mlx.transposed(0, 2, 1)  // (B, T, C) -> (B, C, T)
-
+        // Generator Inference (Generator accepts (B, T, C))
         let output = dec(z * xMask, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
         
         return output
