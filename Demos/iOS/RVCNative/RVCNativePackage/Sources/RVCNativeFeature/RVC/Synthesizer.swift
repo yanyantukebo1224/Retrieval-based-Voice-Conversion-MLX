@@ -5,29 +5,14 @@ import MLXRandom
 
 /// RVC Synthesizer Implementation for iOS
 ///
-/// This is a Swift/MLX port of the Python MLX implementation in:
-/// - rvc_mlx/lib/mlx/encoders.py (TextEncoder, Encoder)
-/// - rvc_mlx/lib/mlx/generators.py (Generator)
-/// - rvc_mlx/lib/mlx/attentions.py (MultiHeadAttention, FFN)
-///
-/// CRITICAL FIX APPLIED:
-/// - TextEncoder output format: Fixed dimension mismatch (B,C,T vs B,T,C)
-///   - Now correctly transposes stats before splitting
-///   - Returns (m, logs) in (B, C, T) format matching Python
-///   - Returns xMask in (B, 1, T) format matching Python
-///   - This was the "Known issue" in commit df081a66
-///
-/// Architecture matches Python exactly:
-/// - TextEncoder: LeakyReLU(0.1), not GELU
-/// - FFN: ReLU activation (default when activation=None in Python)
-/// - Generator: LeakyReLU with LRELU_SLOPE
-///
-/// Reference: rvc_mlx/lib/mlx/encoders.py, generators.py
+/// CRITICAL FIXES APPLIED:
+/// - ResidualCouplingLayer: Added MLX.clip to logs before exp() to prevent float32 overflow (10^38 explosion).
+/// - ResidualCouplingBlock: Added MLX.eval(h) after memory striding to avoid non-contiguous tensor layout crashes/corruption in Conv1d.
+/// - TextEncoder: Fixed dimension format matching Python (B, C, T).
 
 // MARK: - Utility Functions
 
 func sequenceMask(lengths: MLXArray, maxLength: Int) -> MLXArray {
-    // Creates a mask of shape (B, maxLength) where mask[b, i] = 1 if i < lengths[b]
     let x = MLXArray(0..<maxLength).asType(lengths.dtype)
     return (x.expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)).asType(Float32.self)
 }
@@ -75,12 +60,10 @@ class MultiHeadAttention: Module {
         let t_s = key.shape[1]
         let t_t = query.shape[1]
         
-        // Reshape for multi-head: (B, T, C) -> (B, T, Heads, HeadDim) -> (B, Heads, T, HeadDim)
         var q = query.reshaped([b, t_t, nHeads, kChannels]).transposed(0, 2, 1, 3)
         var k = key.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
         var v = value.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
         
-        // Scaled dot-product attention
         var scores = MLX.matmul(q / sqrt(Float(kChannels)), k.transposed(0, 1, 3, 2))
         
         if let mask = mask {
@@ -90,7 +73,6 @@ class MultiHeadAttention: Module {
         let pAttn = drop(softmax(scores, axis: -1))
         var output = MLX.matmul(pAttn, v)
         
-        // Reshape back to (B, T_t, C)
         output = output.transposed(0, 2, 1, 3).reshaped([b, t_t, -1])
         return (output, pAttn)
     }
@@ -161,10 +143,7 @@ class RVCEncoder: Module {
     }
     
     func callAsFunction(_ x: MLXArray, xMask: MLXArray) -> MLXArray {
-        // x: (B, L, C), xMask: (B, L, 1)
         let xMaskB = xMask.asType(Float32.self)
-        
-        // Create attention mask: (B, L, 1) * (B, 1, L) -> (B, L, L) -> (B, 1, L, L)
         let attnMask = (xMaskB * xMaskB.transposed(0, 2, 1)).expandedDimensions(axis: 1)
         
         var h = x * xMask
@@ -204,72 +183,56 @@ class TextEncoder: Module {
     }
     
     func callAsFunction(_ phone: MLXArray, pitch: MLXArray?, lengths: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
-        // phone: (B, L, EmbDim), pitch: (B, L), lengths: (B,)
         var x = emb_phone(phone)
-        print("DEBUG: TextEncoder emb_phone: min \(x.min().item(Float.self)), max \(x.max().item(Float.self))")
         
         if let pitch = pitch, let embPitch = emb_pitch {
             let pEmb = embPitch(pitch)
-            print("DEBUG: TextEncoder emb_pitch: min \(pEmb.min().item(Float.self)), max \(pEmb.max().item(Float.self))")
             x = x + pEmb
         }
         
         x = x * sqrt(Float(hiddenChannels))
         x = leakyRelu(x, negativeSlope: 0.1)
         
-        // Create mask
         let xMask = sequenceMask(lengths: lengths, maxLength: x.shape[1])
         let xMaskExpanded = xMask.expandedDimensions(axis: -1)  // (B, L, 1)
         
         x = encoder(x, xMask: xMaskExpanded)
 
         let stats = proj(x) * xMaskExpanded
-
-        // CRITICAL: Transpose to match Python PyTorch format (B, C, T) before splitting
-        // Python line 141: stats = stats.transpose(0, 2, 1)  # (B, T, C*2) -> (B, C*2, T)
-        // This was the "dimension format mismatch" bug!
         let statsTransposed = stats.transposed(0, 2, 1)  // (B, L, C*2) -> (B, C*2, L)
 
-        // Split on channel dimension (axis=1) to match Python
-        // Python line 144: m, logs = mx.split(stats, 2, axis=1)
         let splitIdx = outChannels
         let m = statsTransposed[0..., 0..<splitIdx, 0...]  // (B, C, L)
         let logs = statsTransposed[0..., splitIdx..., 0...]  // (B, C, L)
 
-        // Return xMask in (B, 1, L) format to match Python
-        // Python line 148: x_mask_out = x_mask[:, None, :]
         let xMaskOut = xMask.expandedDimensions(axis: 1)  // (B, L) -> (B, 1, L)
 
         return (m, logs, xMaskOut)
     }
 }
 
-// MARK: - WaveNet for Flow (Matches Python MLX exactly)
+// MARK: - WaveNet for Flow
 
 class WaveNet: Module {
     let hiddenChannels: Int
     let nLayers: Int
     let cond_layer: MLXNN.Conv1d?
 
-    // Individual layers registered as in_layer_0, in_layer_1, etc. to match Python weight keys
     let in_layer_0: MLXNN.Conv1d
     let in_layer_1: MLXNN.Conv1d
     let in_layer_2: MLXNN.Conv1d
 
-    // res_skip_layer_2 (last layer) outputs hidden_channels, others output 2*hidden_channels
     let res_skip_layer_0: MLXNN.Conv1d
     let res_skip_layer_1: MLXNN.Conv1d
     let res_skip_layer_2: MLXNN.Conv1d
 
     init(hiddenChannels: Int, kernelSize: Int, dilationRate: Int, nLayers: Int, ginChannels: Int) {
-        assert(nLayers == 3, "WaveNet hardcoded for 3 layers to match Python architecture")
+        assert(nLayers == 3, "WaveNet hardcoded for 3 layers")
         self.hiddenChannels = hiddenChannels
         self.nLayers = nLayers
 
-        // Single cond_layer at WaveNet level: outputs 2 * hidden * n_layers channels
         self.cond_layer = ginChannels != 0 ? MLXNN.Conv1d(inputChannels: ginChannels, outputChannels: 2 * hiddenChannels * nLayers, kernelSize: 1) : nil
 
-        // Create in_layers with proper dilation and padding
         let dilations = (0..<nLayers).map { Int(pow(Double(dilationRate), Double($0))) }
         let paddings = dilations.map { (kernelSize * $0 - $0) / 2 }
 
@@ -277,10 +240,9 @@ class WaveNet: Module {
         self.in_layer_1 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: 2 * hiddenChannels, kernelSize: kernelSize, padding: paddings[1], dilation: dilations[1])
         self.in_layer_2 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: 2 * hiddenChannels, kernelSize: kernelSize, padding: paddings[2], dilation: dilations[2])
 
-        // res_skip_layers: last layer outputs hidden_channels, others output 2*hidden_channels
         self.res_skip_layer_0 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: 2 * hiddenChannels, kernelSize: 1)
         self.res_skip_layer_1 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: 2 * hiddenChannels, kernelSize: 1)
-        self.res_skip_layer_2 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: hiddenChannels, kernelSize: 1)  // Last layer: hidden only
+        self.res_skip_layer_2 = MLXNN.Conv1d(inputChannels: hiddenChannels, outputChannels: hiddenChannels, kernelSize: 1)
 
         super.init()
     }
@@ -289,33 +251,28 @@ class WaveNet: Module {
         var h = x
         var outputAcc = MLX.zeros(like: x)
 
-        // Apply cond_layer once to g, then slice per layer
         var gCond: MLXArray? = nil
         if let g = g, let condLayer = cond_layer {
-            gCond = condLayer(g)  // Shape: (B, T, 2*hidden*n_layers)
+            gCond = condLayer(g)
         }
 
-        // Get in_layers and res_skip_layers as arrays for iteration
         let inLayers = [in_layer_0, in_layer_1, in_layer_2]
         let resSkipLayers = [res_skip_layer_0, res_skip_layer_1, res_skip_layer_2]
 
         for i in 0..<nLayers {
             let xIn = inLayers[i](h)
 
-            // Slice conditioning for this layer
             var acts: MLXArray
             if let gCond = gCond {
                 let startCh = i * 2 * hiddenChannels
                 let endCh = (i + 1) * 2 * hiddenChannels
-                let gSlice = gCond[0..., 0..., startCh..<endCh]  // (B, T, 2*hidden)
+                let gSlice = gCond[0..., 0..., startCh..<endCh]
 
-                // Gated activation: tanh(xIn + gSlice half) * sigmoid(xIn + gSlice half)
                 let combined = xIn + gSlice
                 let tAct = tanh(combined[0..., 0..., 0..<hiddenChannels])
                 let sAct = sigmoid(combined[0..., 0..., hiddenChannels...])
                 acts = tAct * sAct
             } else {
-                // No conditioning
                 let tAct = tanh(xIn[0..., 0..., 0..<hiddenChannels])
                 let sAct = sigmoid(xIn[0..., 0..., hiddenChannels...])
                 acts = tAct * sAct
@@ -324,12 +281,10 @@ class WaveNet: Module {
             let resSkipActs = resSkipLayers[i](acts)
 
             if i < nLayers - 1 {
-                // Non-last layer: split into res and skip
                 let resActs = resSkipActs[0..., 0..., 0..<hiddenChannels]
                 h = (h + resActs) * xMask
                 outputAcc = outputAcc + resSkipActs[0..., 0..., hiddenChannels...]
             } else {
-                // Last layer: entire output is skip (no res split)
                 outputAcc = outputAcc + resSkipActs
             }
         }
@@ -360,7 +315,6 @@ class ResidualCouplingLayer: Module {
     }
     
     func callAsFunction(_ x: MLXArray, xMask: MLXArray, g: MLXArray?, reverse: Bool = false) -> MLXArray {
-        // x: (B, L, C)
         let x0 = x[0..., 0..., 0..<halfChannels]
         var x1 = x[0..., 0..., halfChannels...]
         
@@ -379,10 +333,13 @@ class ResidualCouplingLayer: Module {
             logs = stats[0..., 0..., halfChannels...]
         }
         
+        // 🚨【最重要修正】指数関数の数値爆発 (10^38) を防止するためにクランプを追加
+        let clampedLogs = MLX.clip(logs, min: -9.0, max: 9.0)
+        
         if !reverse {
-            x1 = (m + x1 * exp(logs)) * xMask
+            x1 = (m + x1 * exp(clampedLogs)) * xMask
         } else {
-            x1 = (x1 - m) * exp(-logs) * xMask
+            x1 = (x1 - m) * exp(-clampedLogs) * xMask
         }
         
         return MLX.concatenated([x0, x1], axis: -1)
@@ -390,19 +347,17 @@ class ResidualCouplingLayer: Module {
 }
 
 // MARK: - Residual Coupling Block (flow)
-// Uses named properties flow_0, flow_1, etc. to match weight file keys
 
 class ResidualCouplingBlock: Module {
     let nFlows: Int
 
-    // Named properties to match weight keys: flow.flow_0.enc..., flow.flow_1.enc..., etc.
     let flow_0: ResidualCouplingLayer
     let flow_1: ResidualCouplingLayer
     let flow_2: ResidualCouplingLayer
     let flow_3: ResidualCouplingLayer
 
     init(channels: Int, hiddenChannels: Int, kernelSize: Int, dilationRate: Int, nLayers: Int, nFlows: Int = 4, ginChannels: Int) {
-        assert(nFlows == 4, "ResidualCouplingBlock hardcoded for 4 flows to match Python architecture")
+        assert(nFlows == 4, "ResidualCouplingBlock hardcoded for 4 flows")
         self.nFlows = nFlows
 
         self.flow_0 = ResidualCouplingLayer(channels: channels, hiddenChannels: hiddenChannels, kernelSize: kernelSize, dilationRate: dilationRate, nLayers: nLayers, ginChannels: ginChannels, meanOnly: true)
@@ -418,15 +373,15 @@ class ResidualCouplingBlock: Module {
         let flows = [flow_0, flow_1, flow_2, flow_3]
 
         if !reverse {
-            // Forward: flow then flip
             for i in 0..<nFlows {
                 h = flows[i](h, xMask: xMask, g: g, reverse: false)
-                h = h[0..., 0..., .stride(by: -1)]  // Flip channels
+                h = h[0..., 0..., .stride(by: -1)]
+                MLX.eval(h) // 🚨【修正】メモリレイアウト不連続によるクラッシュ防止
             }
         } else {
-            // Reverse: flip then flow (CRITICAL: different order from forward!)
             for i in (0..<nFlows).reversed() {
-                h = h[0..., 0..., .stride(by: -1)]  // Flip first!
+                h = h[0..., 0..., .stride(by: -1)]
+                MLX.eval(h) // 🚨【修正】メモリレイアウト不連続によるクラッシュ防止
                 h = flows[i](h, xMask: xMask, g: g, reverse: true)
             }
         }
@@ -439,7 +394,7 @@ class ResidualCouplingBlock: Module {
 
 public class Synthesizer: Module {
     let enc_p: TextEncoder
-    let dec: Generator  // Use existing Generator from RVCModel.swift
+    let dec: Generator
     let flow: ResidualCouplingBlock
     let emb_g: MLXNN.Embedding
     let useF0: Bool
@@ -462,7 +417,6 @@ public class Synthesizer: Module {
     ) {
         self.useF0 = useF0
 
-        // TextEncoder: transforms 768-dim HuBERT -> 192-dim latent
         self.enc_p = TextEncoder(
             outChannels: interChannels,
             hiddenChannels: hiddenChannels,
@@ -475,10 +429,8 @@ public class Synthesizer: Module {
             f0: useF0
         )
 
-        // Generator: now supports dynamic configuration
         self.dec = Generator(inputChannels: interChannels, ginChannels: ginChannels, upsampleRates: upsampleRates, upsampleKernelSizes: upsampleKernelSizes, sampleRate: sampleRate)
         
-        // Flow: reverse flow for voice conversion
         self.flow = ResidualCouplingBlock(
             channels: interChannels,
             hiddenChannels: hiddenChannels,
@@ -489,47 +441,28 @@ public class Synthesizer: Module {
             ginChannels: ginChannels
         )
         
-        // Speaker embedding
         self.emb_g = MLXNN.Embedding(embeddingCount: speakerEmbedDim, dimensions: ginChannels)
         
         super.init()
     }
     
     public func infer(phone: MLXArray, phoneLengths: MLXArray, pitch: MLXArray?, nsff0: MLXArray?, sid: MLXArray) -> MLXArray {
-        // phone: (B, L, 768) - HuBERT features
-        // pitch: (B, L) - coarse pitch (for embedding lookup)
-        // nsff0: (B, L) - continuous F0 in Hz
-        // sid: (B,) - speaker ID
-        
-        // Get speaker embedding: (B, 1, C)
         let g = emb_g(sid).expandedDimensions(axis: 1)
         
-        // Encode features
         let (m_p, logs_p, xMask) = enc_p(phone, pitch: pitch, lengths: phoneLengths)
-        print("DEBUG: TextEncoder output - m_p: \(m_p.shape) [\(m_p.min().item(Float.self))...\(m_p.max().item(Float.self))], logs_p: \(logs_p.shape) [\(logs_p.min().item(Float.self))...\(logs_p.max().item(Float.self))], xMask: \(xMask.shape)")
+        
+        // 🚨【修正】logs_p をクランプし、決定的な潜在変数を安定生成
+        let clampedLogsP = MLX.clip(logs_p, min: -9.0, max: 9.0)
+        let z_p = (m_p + exp(clampedLogsP) * MLXRandom.normal(m_p.shape).asType(m_p.dtype) * 0.0) * xMask
 
-        // Sample from encoded distribution
-        // CRITICAL: xMask is already (B, 1, T) from TextEncoder - don't expand it!
-        // Broadcasts: (B, C, T) * (B, 1, T) = (B, C, T)
-        let z_p = (m_p + exp(logs_p) * MLXRandom.normal(m_p.shape).asType(m_p.dtype) * 0.0) * xMask
-        print("DEBUG: z_p shape: \(z_p.shape), stats: min \(z_p.min().item(Float.self)), max \(z_p.max().item(Float.self))")
-
-        // Flow reverse pass
-        // Convert to (B, T, C) format for Flow (Python line 117-118)
         let z_p_transposed = z_p.transposed(0, 2, 1)  // (B, C, T) -> (B, T, C)
         let xMask_transposed = xMask.transposed(0, 2, 1)  // (B, 1, T) -> (B, T, 1)
 
-        let z_mlx = flow(z_p_transposed, xMask: xMask_transposed, g: g, reverse: true)  // Output: (B, T, C)
-        print("DEBUG: z_mlx (after flow) shape: \(z_mlx.shape), stats: min \(z_mlx.min().item(Float.self)), max \(z_mlx.max().item(Float.self))")
+        let z_mlx = flow(z_p_transposed, xMask: xMask_transposed, g: g, reverse: true)
 
-        // Convert back to (B, C, T) for decoder (Python line 123)
         let z = z_mlx.transposed(0, 2, 1)  // (B, T, C) -> (B, C, T)
 
-        // Decode to audio
-        // Decoder input: z * x_mask where both are (B, C, T)
-        // Python line 128: o = self.dec(z * x_mask, nsff0, g=g)
         let output = dec(z * xMask, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
-        print("DEBUG: Generator output stats: min \(output.min().item(Float.self)), max \(output.max().item(Float.self))")
         
         return output
     }
