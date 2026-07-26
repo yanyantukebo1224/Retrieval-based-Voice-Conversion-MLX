@@ -197,7 +197,7 @@ class TextEncoder: Module {
         // MLX Standard: proj outputs (B, T, outChannels * 2)
         let stats = proj(x) * xMaskExpanded
 
-        // 軸を転置せず最後のアシス (Channel) で 2 分割 (B, T, C)
+        // チャンネル軸 (Channel) で 2 分割 (B, T, C)
         let splitIdx = outChannels
         let m = stats[0..., 0..., 0..<splitIdx]         // (B, T, C)
         let logs = stats[0..., 0..., splitIdx...]       // (B, T, C)
@@ -453,11 +453,8 @@ public class Synthesizer: Module {
         // Flow 逆変換 (B, T, C)
         let z = flow(z_p, xMask: xMask, g: g, reverse: true)
 
-        // Generator(dec) への入力用に (B, T, C) -> (B, C, T) へ転置
-        let z_transposed = (z * xMask).transposed(0, 2, 1)
-
-        // Waveform 変換を実行
-        let output = dec(z_transposed, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
+        // MLX Generator にそのまま (B, T, C) 形式で入力
+        let output = dec(z * xMask, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
         
         return output
     }
