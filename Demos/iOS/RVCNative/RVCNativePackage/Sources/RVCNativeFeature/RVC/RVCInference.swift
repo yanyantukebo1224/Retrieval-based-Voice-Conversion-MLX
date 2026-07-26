@@ -155,11 +155,7 @@ public class RVCInference: ObservableObject {
              newParams.removeValue(forKey: vKey)
         }
         
-        do {
-            self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
-        } catch {
-            log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
-        }
+        self.hubertModel?.update(parameters: ModuleParameters.unflattened(newParams))
         
         // 2. Load Synthesizer
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
@@ -298,12 +294,8 @@ public class RVCInference: ObservableObject {
             }
         }
 
-        do {
-            try self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
-            self.synthesizer?.train(false)
-        } catch {
-            log("RVCInference: ⚠️ Error updating Synthesizer: \(error)")
-        }
+        self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
+        self.synthesizer?.train(false)
         
         // 3. Load RMVPE
         if let rmvpeURL = rmvpeURL {
@@ -352,7 +344,7 @@ public class RVCInference: ObservableObject {
                     remappedRMVPE[newKey] = val
                 }
 
-                try self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
+                self.rmvpe?.update(parameters: ModuleParameters.unflattened(remappedRMVPE))
                 self.rmvpe?.setTrainingMode(false)
                 log("RVCInference: ✅ RMVPE loaded")
             } catch {
@@ -472,7 +464,7 @@ public class RVCInference: ObservableObject {
         let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
         var phone = broadcasted.reshaped([N, L * 2, C])
         
-        // 🚨【最重要修正】F0 のフレーム数に完全一致させる（位相不一致と無音パルスノイズの防止）
+        // F0 のフレーム数に完全一致させる
         let targetLen = f0.shape[1]
         let phoneLen = phone.shape[1]
         
@@ -481,8 +473,8 @@ public class RVCInference: ObservableObject {
                 phone = phone[0..., 0..<targetLen, 0...]
             } else {
                 let padLen = targetLen - phoneLen
-                let lastFrame = phone[0..., (phoneLen-1)...<phoneLen, 0...]
-                let padding = MLX.repeat(lastFrame, count: padLen, axis: 1)
+                let lastFrame = phone[0..., (phoneLen - 1)..<phoneLen, 0...]
+                let padding = MLX.repeated(lastFrame, count: padLen, axis: 1)
                 phone = MLX.concatenated([phone, padding], axis: 1)
             }
         }
@@ -519,7 +511,7 @@ public class RVCInference: ObservableObject {
         let sid = MLXArray([Int32(0)])
 
         // 4. Synthesizer 推論実行
-        let audioConverted: MLXArray = try autoreleasepool {
+        let audioConverted: MLXArray = autoreleasepool {
             let out = synth.infer(
                 phone: phone,
                 phoneLengths: phoneLengths,
