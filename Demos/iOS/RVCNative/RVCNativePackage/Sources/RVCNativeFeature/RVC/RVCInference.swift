@@ -123,6 +123,7 @@ public class RVCInference: ObservableObject {
                 }
             }
             
+            // HuBERT 1D Conv transpose: PyTorch [Out, In, K] -> MLX [Out, K, In]
             if newKey.hasSuffix(".weight") && val.ndim == 3 {
                 val = val.transposed(axes: [0, 2, 1])
             }
@@ -246,10 +247,14 @@ public class RVCInference: ObservableObject {
                 else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
+            // 🚨【最重要修正】PyTorch 1D Conv [Out, In, K] -> MLX Conv1d [Out, K, In]
+            // すべての 1D Conv 重みを統一して [Out, K, In] に転置する
             if newK.hasSuffix(".weight") && newV.ndim == 3 {
                 if newK.contains(".up_") || newK.contains(".ups.") {
+                    // TransposeConv1d
                     newV = newV.transposed(axes: [1, 2, 0])
                 } else {
+                    // 標準 Conv1d
                     newV = newV.transposed(axes: [0, 2, 1])
                 }
             }
@@ -493,18 +498,15 @@ public class RVCInference: ObservableObject {
         let f0_min: Float = 50.0
         let f0_max: Float = 1100.0
         
-        // 🚨【安全化】無音・ノイズ判定周波数は先に0.0Hzへ固定
         let f0HzClean = MLX.where(f0Hz .<= f0_min, MLXArray(0.0), f0Hz)
         
         let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
         let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
         
-        // 有音フレームのみ安全に Mel スケールにマッピング
         let f0_mel = 1127.0 * MLX.log(1.0 + MLX.maximum(f0HzClean, f0_min) / 700.0)
         
         var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
         
-        // 50Hz未満（無音）のピッチバケットは 1 に固定
         pitch = MLX.where(f0HzClean .== 0.0, MLXArray(1.0), pitch) 
         pitch = MLX.clip(pitch, min: 1.0, max: 255.0)
         let pitchBuckets = pitch.asType(Int32.self)
