@@ -197,7 +197,7 @@ class TextEncoder: Module {
         // MLX Standard: proj outputs (B, T, outChannels * 2)
         let stats = proj(x) * xMaskExpanded
 
-        // 🚨【最重要修正】次元を転置せず、Channel軸(最後のアシス)で2分割する (B, T, C)
+        // 軸を転置せず最後のアシス (Channel) で 2 分割 (B, T, C)
         let splitIdx = outChannels
         let m = stats[0..., 0..., 0..<splitIdx]         // (B, T, C)
         let logs = stats[0..., 0..., splitIdx...]       // (B, T, C)
@@ -444,17 +444,20 @@ public class Synthesizer: Module {
     public func infer(phone: MLXArray, phoneLengths: MLXArray, pitch: MLXArray?, nsff0: MLXArray?, sid: MLXArray) -> MLXArray {
         let g = emb_g(sid).expandedDimensions(axis: 1)
         
-        // m_p, logs_p, xMask are all in (B, T, C) format
+        // m_p, logs_p, xMask はすべて (B, T, C) 形式
         let (m_p, logs_p, xMask) = enc_p(phone, pitch: pitch, lengths: phoneLengths)
         
         let clampedLogsP = MLX.clip(logs_p, min: -9.0, max: 9.0)
         let z_p = (m_p + exp(clampedLogsP) * MLXRandom.normal(m_p.shape).asType(m_p.dtype) * 0.0) * xMask
 
-        // Flow Pass (Input and Output remain in (B, T, C))
+        // Flow 逆変換 (B, T, C)
         let z = flow(z_p, xMask: xMask, g: g, reverse: true)
 
-        // Generator Inference (Generator accepts (B, T, C))
-        let output = dec(z * xMask, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
+        // Generator(dec) への入力用に (B, T, C) -> (B, C, T) へ転置
+        let z_transposed = (z * xMask).transposed(0, 2, 1)
+
+        // Waveform 変換を実行
+        let output = dec(z_transposed, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
         
         return output
     }
