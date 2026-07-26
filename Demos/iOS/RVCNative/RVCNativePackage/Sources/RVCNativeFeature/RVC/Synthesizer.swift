@@ -55,9 +55,9 @@ class MultiHeadAttention: Module {
         let t_s = key.shape[1]
         let t_t = query.shape[1]
         
-        var q = query.reshaped([b, t_t, nHeads, kChannels]).transposed(0, 2, 1, 3)
-        var k = key.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
-        var v = value.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
+        let q = query.reshaped([b, t_t, nHeads, kChannels]).transposed(0, 2, 1, 3)
+        let k = key.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
+        let v = value.reshaped([b, t_s, nHeads, kChannels]).transposed(0, 2, 1, 3)
         
         var scores = MLX.matmul(q / sqrt(Float(kChannels)), k.transposed(0, 1, 3, 2))
         
@@ -178,7 +178,6 @@ class TextEncoder: Module {
     }
     
     func callAsFunction(_ phone: MLXArray, pitch: MLXArray?, lengths: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
-        // phone: (B, T, EmbDim)
         var x = emb_phone(phone)
         
         if let pitch = pitch, let embPitch = emb_pitch {
@@ -194,10 +193,16 @@ class TextEncoder: Module {
         
         x = encoder(x, xMask: xMaskExpanded)
 
-        // MLX Standard: proj outputs (B, T, outChannels * 2)
-        let stats = proj(x) * xMaskExpanded
+        // proj (Conv1d) は (B, T, C) を受け取り (B, T, C*2) を返すはずだが
+        // なぜかここまでは (B, C, T) になってしまっていた可能性があるため
+        // 🚨 明示的に (B, T, C) に確実に転置して返す
+        
+        var stats = proj(x) * xMaskExpanded
+        if stats.shape[1] == outChannels * 2 {
+            // (B, C, T) 担ってしまっている場合 (B, T, C) に直す
+            stats = stats.transposed(0, 2, 1)
+        }
 
-        // 転置せず Channel 軸（最後のアシス）で 2 分割 (B, T, C)
         let splitIdx = outChannels
         let m = stats[0..., 0..., 0..<splitIdx]         // (B, T, C)
         let logs = stats[0..., 0..., splitIdx...]       // (B, T, C)
@@ -370,12 +375,12 @@ class ResidualCouplingBlock: Module {
         if !reverse {
             for i in 0..<nFlows {
                 h = flows[i](h, xMask: xMask, g: g, reverse: false)
-                h = h[0..., 0..., .stride(by: -1)]
+                h = h[0..., .stride(by: -1), 0...]
                 MLX.eval(h)
             }
         } else {
             for i in (0..<nFlows).reversed() {
-                h = h[0..., 0..., .stride(by: -1)]
+                h = h[0..., .stride(by: -1), 0...]
                 MLX.eval(h)
                 h = flows[i](h, xMask: xMask, g: g, reverse: true)
             }
@@ -444,7 +449,7 @@ public class Synthesizer: Module {
     public func infer(phone: MLXArray, phoneLengths: MLXArray, pitch: MLXArray?, nsff0: MLXArray?, sid: MLXArray) -> MLXArray {
         let g = emb_g(sid).expandedDimensions(axis: 1)
         
-        // m_p, logs_p, xMask はすべて (B, T, C) 形式
+        // m_p, logs_p, xMask は確実に (B, T, C) で返ってくる
         let (m_p, logs_p, xMask) = enc_p(phone, pitch: pitch, lengths: phoneLengths)
         
         let clampedLogsP = MLX.clip(logs_p, min: -9.0, max: 9.0)
@@ -453,7 +458,7 @@ public class Synthesizer: Module {
         // Flow 逆変換 (B, T, C)
         let z = flow(z_p, xMask: xMask, g: g, reverse: true)
 
-        // MLX Conv1d 仕様に合わせて転置は行わず、(B, T, C) のまま渡す
+        // MLX Conv1d 仕様に合わせて (B, T, C) のまま渡す
         let output = dec(z * xMask, f0: nsff0 ?? MLX.zeros([phone.shape[0], phone.shape[1], 1]), g: g)
         
         return output
