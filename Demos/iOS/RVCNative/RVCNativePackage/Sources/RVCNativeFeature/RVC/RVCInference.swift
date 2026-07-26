@@ -8,6 +8,7 @@ public class RVCInference: ObservableObject {
     public static let bundle = Bundle.module
     @Published public var status: String = "Idle"
     
+    // Callback for logging to UI
     public var onLog: ((String) -> Void)?
     
     var hubertModel: HubertModel?
@@ -17,7 +18,7 @@ public class RVCInference: ObservableObject {
     var dspPitch: DSPPitchExtractor?
     var indexManager: IndexManager?
     var indexRate: Float = 0.75
-    var modelSampleRate: Int = 40000
+    var modelSampleRate: Int = 40000  // Detected from model config
     
     private func log(_ message: String) {
         print(message)
@@ -34,6 +35,7 @@ public class RVCInference: ObservableObject {
         #endif
     }
 
+    /// Unload all models to free memory
     public func unloadModels() {
         log("RVCInference: Unloading models...")
         hubertModel = nil
@@ -47,15 +49,21 @@ public class RVCInference: ObservableObject {
         log("RVCInference: Models unloaded.")
     }
 
+    /// Load index vectors for speaker embedding retrieval.
     public func loadIndex(url: URL, rate: Float = 0.75) throws {
         log("RVCInference: Loading index from \(url.lastPathComponent)")
         let manager = IndexManager()
-        try manager.load(url: url, logger: { [weak self] msg in self?.log(msg) })
+        
+        try manager.load(url: url, logger: { [weak self] msg in
+            self?.log(msg)
+        })
+        
         self.indexManager = manager
         self.indexRate = rate
         log("RVCInference: Index loaded with \(manager.count) vectors, rate=\(rate)")
     }
 
+    /// Unload the index to free memory.
     public func unloadIndex() {
         indexManager?.unload()
         indexManager = nil
@@ -63,6 +71,7 @@ public class RVCInference: ObservableObject {
     }
 
     public func loadWeights(hubertURL: URL, modelURL: URL, rmvpeURL: URL? = nil, crepeURL: URL? = nil) async throws {
+        // 🚨【安全ガード】RMVPE や HuBERT が誤ってメインボイスモデル (modelURL) に渡された場合は弾く
         let modelName = modelURL.lastPathComponent.lowercased()
         if modelName.contains("rmvpe") || modelName.contains("hubert") {
             log("RVCInference: ⚠️ [GUARD] Invalid modelURL (\(modelURL.lastPathComponent)). RMVPE/HuBERT cannot be loaded as Synthesizer!")
@@ -71,7 +80,9 @@ public class RVCInference: ObservableObject {
 
         DispatchQueue.main.async { self.status = "Loading models..." }
         
+        // ==========================================
         // 1. Load Hubert
+        // ==========================================
         log("RVCInference: Loading Hubert from \(hubertURL.lastPathComponent)")
         var actualHubertURL = hubertURL
         let hExt = hubertURL.pathExtension.lowercased()
@@ -119,6 +130,7 @@ public class RVCInference: ObservableObject {
                 }
             }
             
+            // HuBERT 1D Conv transpose: PyTorch [Out, In, K] -> MLX [Out, K, In]
             if newKey.hasSuffix(".weight") && val.ndim == 3 {
                 val = val.transposed(axes: [0, 2, 1])
             }
@@ -157,7 +169,9 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Warning: Failed to update HuBERT parameters: \(error)")
         }
         
-        // 2. Load Synthesizer
+        // ==========================================
+        // 2. Load Synthesizer (Main Voice Model)
+        // ==========================================
         log("RVCInference: Loading Synthesizer from \(modelURL.lastPathComponent)")
         let modelWeights = try MLX.loadArrays(url: modelURL)
 
@@ -242,6 +256,7 @@ public class RVCInference: ObservableObject {
                 else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
+            // Synthesizer Conv transpose logic
             if newK.hasSuffix(".weight") && newV.ndim == 3 {
                 if newK.contains(".up_") || newK.contains(".ups.") {
                     newV = newV.transposed(axes: [1, 2, 0])
@@ -301,7 +316,9 @@ public class RVCInference: ObservableObject {
             log("RVCInference: ⚠️ Error updating Synthesizer: \(error)")
         }
         
+        // ==========================================
         // 3. Load RMVPE
+        // ==========================================
         if let rmvpeURL = rmvpeURL {
             do {
                 let rmvpeWeights = try MLX.loadArrays(url: rmvpeURL)
@@ -340,9 +357,9 @@ public class RVCInference: ObservableObject {
                     var val = v
                     if newKey.hasSuffix(".weight") {
                         if val.ndim == 3 {
-                            val = val.transposed(axes: [0, 2, 1])
+                            val = val.transposed(axes: [0, 2, 1]) // 1D Conv: [Out, In, K] -> [Out, K, In]
                         } else if val.ndim == 4 {
-                            val = val.transposed(axes: [0, 2, 3, 1])
+                            val = val.transposed(axes: [0, 2, 3, 1]) // 2D Conv: [Out, In, H, W] -> [Out, H, W, In]
                         }
                     }
                     remappedRMVPE[newKey] = val
@@ -378,14 +395,14 @@ public class RVCInference: ObservableObject {
             let (audioArray, nativeSR) = try AudioProcessor.shared.loadAudio(url: audioURL)
             let totalSamples = audioArray.size
             
-            let maxSamples = Int(nativeSR * 30.0) // 最大30秒
+            let maxSamples = Int(nativeSR * 30.0)
             var audioToProcess = audioArray
             if totalSamples > maxSamples {
                 audioToProcess = audioArray[0..<maxSamples]
             }
             
             audioToProcess = applyButterworthHighPass(audioToProcess)
-            let padSamples = Int(nativeSR * 0.1) // 0.1秒のパッディング
+            let padSamples = Int(nativeSR * 0.1)
             let audioPadded = padReflect(audioToProcess, padding: padSamples)
             
             let outputPadded = try await inferChunk(
@@ -448,15 +465,15 @@ public class RVCInference: ObservableObject {
         GPU.clearCache()
         
         // ----------------------------------------------------
-        // RMVPE による ピッチ (F0) 検出とノイズ対策カット処理
+        // 🚨【最重要ノイズ対策】RMVPE 判定閾値を引き上げて誤発振をカット
         // ----------------------------------------------------
         var f0: MLXArray
         if let rmvpe = rmvpe {
-            // 閾値を 0.15 に上げて無音部分のノイズ判定をカット
+            // 閾値(thred)を 0.15 に引き上げ（無音/息部分の発振防止）
             f0 = rmvpe.infer(audio: cleanAudio, thred: 0.15)
         } else {
             let frames = hubertFeatures.shape[1] * 2
-            f0 = MLX.full([1, frames, 1], values: MLXArray(0.0)) // 無音デフォルト
+            f0 = MLX.zeros([1, frames, 1]) // デフォルトは完全無音 (0.0 Hz)
         }
         MLX.eval(f0)
         GPU.clearCache()
@@ -489,22 +506,25 @@ public class RVCInference: ObservableObject {
             let multiplier = pow(2.0, Float(pitchShift) / 12.0)
             f0Hz = f0Hz * multiplier
         }
+        
         let f0_min: Float = 50.0
         let f0_max: Float = 1100.0
         let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
         let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
         let f0_mel = 1127.0 * MLX.log(1.0 + f0Hz / 700.0)
         
-        // F0 が f0_min (50Hz) 以下の部分はすべて無音(バケツ1)として処理
         var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
+        
+        // 🚨【最重要】50Hz未満の無音・子音領域はピッチバケツを 1 (無音) に固定
         pitch = MLX.where(f0Hz .<= f0_min, MLXArray(1.0), pitch) 
         pitch = MLX.maximum(pitch, 1.0)
         pitch = MLX.minimum(pitch, 255.0)
         let pitchBuckets = pitch.asType(Int32.self)
         
-        // F0Hz も同様に無音部分は 0.0 にクリア
+        // 🚨【最重要】発振器 (Harmonic Source) に渡す F0Hz も 50Hz未満は 0.0 Hz に強制設定して発振停止
         let f0HzClean = MLX.where(f0Hz .<= f0_min, MLXArray(0.0), f0Hz)
         let nsff0 = f0HzClean.expandedDimensions(axis: 2)
+        
         let phoneLengths = MLXArray([Int32(minLen)])
         let sid = MLXArray([Int32(0)])
 
