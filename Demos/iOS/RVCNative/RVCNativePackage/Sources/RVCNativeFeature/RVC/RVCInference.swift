@@ -123,7 +123,6 @@ public class RVCInference: ObservableObject {
                 }
             }
             
-            // HuBERT 1D Conv transpose: PyTorch [Out, In, K] -> MLX [Out, K, In]
             if newKey.hasSuffix(".weight") && val.ndim == 3 {
                 val = val.transposed(axes: [0, 2, 1])
             }
@@ -247,7 +246,6 @@ public class RVCInference: ObservableObject {
                 else if newK.hasSuffix(".bias") { newK = String(newK.dropLast(5)) + ".conv.bias" }
             }
 
-            // PyTorch 1D Conv [Out, In, K] -> MLX Conv1d [Out, K, In]
             if newK.hasSuffix(".weight") && newV.ndim == 3 {
                 if newK.contains(".up_") || newK.contains(".ups.") {
                     newV = newV.transposed(axes: [1, 2, 0])
@@ -442,7 +440,7 @@ public class RVCInference: ObservableObject {
         
         let audioInput = cleanAudio.expandedDimensions(axis: 0)
         
-        // 1. HuBERT による言語特徴量抽出 (ここでログと実行を保証)
+        // 1. HuBERT による言語特徴量抽出
         guard let hubertModel = hubertModel else {
             throw NSError(domain: "RVCInference", code: 1, userInfo: [NSLocalizedDescriptionKey: "HuBERT model not loaded."])
         }
@@ -454,7 +452,7 @@ public class RVCInference: ObservableObject {
         }
         GPU.clearCache()
         
-        // 2. RMVPE によるピッチ検出
+        // 2. RMVPE によるピッチ抽出
         var f0: MLXArray
         if let rmvpe = rmvpe {
             f0 = rmvpe.infer(audio: cleanAudio, thred: 0.15)
@@ -474,12 +472,20 @@ public class RVCInference: ObservableObject {
         let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
         var phone = broadcasted.reshaped([N, L * 2, C])
         
+        // 🚨【最重要修正】F0 のフレーム数に完全一致させる（位相不一致と無音パルスノイズの防止）
+        let targetLen = f0.shape[1]
         let phoneLen = phone.shape[1]
-        let f0Len = f0.shape[1]
-        let minLen = min(phoneLen, f0Len)
         
-        if phoneLen != minLen { phone = phone[0..., 0..<minLen, 0...] }
-        if f0Len != minLen { f0 = f0[0..., 0..<minLen, 0...] }
+        if phoneLen != targetLen {
+            if phoneLen > targetLen {
+                phone = phone[0..., 0..<targetLen, 0...]
+            } else {
+                let padLen = targetLen - phoneLen
+                let lastFrame = phone[0..., (phoneLen-1)...<phoneLen, 0...]
+                let padding = MLX.repeat(lastFrame, count: padLen, axis: 1)
+                phone = MLX.concatenated([phone, padding], axis: 1)
+            }
+        }
 
         if indexRate > 0, let indexManager = indexManager {
             phone = indexManager.search(features: phone, indexRate: indexRate)
@@ -509,7 +515,7 @@ public class RVCInference: ObservableObject {
         let pitchBuckets = pitch.asType(Int32.self)
         
         let nsff0 = f0HzClean.expandedDimensions(axis: 2)
-        let phoneLengths = MLXArray([Int32(minLen)])
+        let phoneLengths = MLXArray([Int32(targetLen)])
         let sid = MLXArray([Int32(0)])
 
         // 4. Synthesizer 推論実行
