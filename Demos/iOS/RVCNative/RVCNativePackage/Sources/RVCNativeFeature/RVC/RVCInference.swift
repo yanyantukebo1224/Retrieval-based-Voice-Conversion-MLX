@@ -165,6 +165,28 @@ public class RVCInference: ObservableObject {
         var detectedUpsRates = [10, 10, 2, 2]
         var detectedKernelSizes = [16, 16, 4, 4]
 
+        // Auto-detect sample rate and upsample rates from weight shapes if no json present
+        if let up1Weight = modelWeights["dec.up_1.weight"] ?? modelWeights["dec.ups.1.weight"] {
+            // Check output/kernel dimension of up_1
+            let kLen = up1Weight.shape.max() ?? 16
+            if kLen == 24 || up1Weight.shape.contains(12) {
+                detectedSR = 48000
+                detectedUpsRates = [10, 12, 2, 2]
+                detectedKernelSizes = [16, 24, 4, 4]
+                log("RVCInference: Auto-detected 48kHz model profile (upsample: [10, 12, 2, 2])")
+            } else if kLen == 12 || up1Weight.shape.contains(6) {
+                detectedSR = 48000
+                detectedUpsRates = [10, 6, 2, 2]
+                detectedKernelSizes = [16, 12, 4, 4]
+                log("RVCInference: Auto-detected 48kHz model profile (upsample: [10, 6, 2, 2])")
+            } else {
+                detectedSR = 40000
+                detectedUpsRates = [10, 10, 2, 2]
+                detectedKernelSizes = [16, 16, 4, 4]
+                log("RVCInference: Auto-detected 40kHz model profile (upsample: [10, 10, 2, 2])")
+            }
+        }
+
         let configURL = modelURL.deletingPathExtension().appendingPathExtension("json")
         if FileManager.default.fileExists(atPath: configURL.path) {
             if let data = try? Data(contentsOf: configURL),
