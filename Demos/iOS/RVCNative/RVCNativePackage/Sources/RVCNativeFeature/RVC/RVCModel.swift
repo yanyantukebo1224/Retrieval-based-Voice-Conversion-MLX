@@ -132,7 +132,7 @@ class SineGenerator: Module {
         let sine_waves = _generate_sine_wave(f0, upsampling_factor: upsampling_factor) * sine_amp
         
         let uv = (f0 .> voiced_threshold).asType(Float32.self)
-        let uv_final = MLX.repeat(uv, count: upsampling_factor, axis: 1)
+        let uv_final = MLX.repeated(uv, count: upsampling_factor, axis: 1)
         
         let noise_amp = uv_final * noise_std + (1 - uv_final) * (sine_amp / 3)
         let noise = MLXRandom.normal(sine_waves.shape) * noise_amp
@@ -254,12 +254,8 @@ class Generator: Module {
     }
     
     func callAsFunction(_ x: MLXArray, f0: MLXArray, g: MLXArray? = nil) -> MLXArray {
-        // 🚨 (B, C, T) で渡された場合のみ (B, T, C) に転置する安全判定
+        // MLX native format is always (B, T, C)
         var out = x
-        if x.ndim == 3 && x.shape[1] == 192 {
-            out = x.transposed(0, 2, 1)  // (B, C, T) -> (B, T, C)
-        }
-
         out = conv_pre(out)
 
         if let g = g, let condLayer = cond {

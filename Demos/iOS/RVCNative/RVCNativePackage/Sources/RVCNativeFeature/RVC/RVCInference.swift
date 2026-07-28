@@ -391,10 +391,10 @@ public class RVCInference: ObservableObject {
             let coreEnd = outputLen - cropSamples
             
             var finalOutput: MLXArray
-            if coreEnd > coreStart {
-                finalOutput = outputPadded[0..., coreStart..<coreEnd, 0...].squeezed(axes: [0, 2])
+            if coreEnd > coreStart && coreEnd <= outputLen {
+                finalOutput = outputPadded[0..., coreStart..<coreEnd, 0...].squeezed()
             } else {
-                finalOutput = outputPadded.squeezed(axes: [0, 2])
+                finalOutput = outputPadded.squeezed()
             }
             
             MLX.eval(finalOutput)
@@ -453,8 +453,8 @@ public class RVCInference: ObservableObject {
         let C = hubertFeatures.shape[2]
         
         let expanded = hubertFeatures.expandedDimensions(axis: 2)
-        let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
-        var phone = broadcasted.reshaped([N, L * 2, C])
+        let repeated = MLX.repeated(expanded, count: 2, axis: 2)
+        var phone = repeated.reshaped([N, L * 2, C])
         
         // F0 と phone のフレーム数を最小長に切り揃える
         let phoneLen = phone.shape[1]
