@@ -169,7 +169,7 @@ public class RVCInference: ObservableObject {
         if let up1Weight = modelWeights["dec.up_1.weight"] ?? modelWeights["dec.ups.1.weight"] {
             // Check output/kernel dimension of up_1
             let kLen = up1Weight.shape.max() ?? 16
-            if kLen == 24 || up1Weight.shape.contains(12) {
+            if kLen == 24 || up1Weight.shape.contains(12) || up1Weight.shape.contains(24) {
                 detectedSR = 48000
                 detectedUpsRates = [10, 12, 2, 2]
                 detectedKernelSizes = [16, 24, 4, 4]

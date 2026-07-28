@@ -275,10 +275,10 @@ public final class PthConverter: Sendable {
             var newKey = k
 
             if newKey.contains("flow.flows.") {
-                newKey = newKey.replacingOccurrences(of: "flow.flows.0", with: "flow.flow_0")
-                newKey = newKey.replacingOccurrences(of: "flow.flows.2", with: "flow.flow_1")
-                newKey = newKey.replacingOccurrences(of: "flow.flows.4", with: "flow.flow_2")
-                newKey = newKey.replacingOccurrences(of: "flow.flows.6", with: "flow.flow_3")
+                newKey = newKey.replacingOccurrences(of: "flow.flows.0.", with: "flow.flow_0.")
+                newKey = newKey.replacingOccurrences(of: "flow.flows.2.", with: "flow.flow_1.")
+                newKey = newKey.replacingOccurrences(of: "flow.flows.4.", with: "flow.flow_2.")
+                newKey = newKey.replacingOccurrences(of: "flow.flows.6.", with: "flow.flow_3.")
             }
 
             let layerPattern = try? NSRegularExpression(pattern: "(in_layers|res_skip_layers)\\.(\\d+)")
