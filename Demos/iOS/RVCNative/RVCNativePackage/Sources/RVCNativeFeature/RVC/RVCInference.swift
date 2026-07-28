@@ -464,20 +464,13 @@ public class RVCInference: ObservableObject {
         let broadcasted = MLX.broadcast(expanded, to: [N, L, 2, C])
         var phone = broadcasted.reshaped([N, L * 2, C])
         
-        // F0 のフレーム数に完全一致させる
-        let targetLen = f0.shape[1]
+        // F0 と phone のフレーム数を最小長に切り揃える
         let phoneLen = phone.shape[1]
+        let f0Len = f0.shape[1]
+        let minLen = min(phoneLen, f0Len)
         
-        if phoneLen != targetLen {
-            if phoneLen > targetLen {
-                phone = phone[0..., 0..<targetLen, 0...]
-            } else {
-                let padLen = targetLen - phoneLen
-                let lastFrame = phone[0..., (phoneLen - 1)..<phoneLen, 0...]
-                let padding = MLX.repeated(lastFrame, count: padLen, axis: 1)
-                phone = MLX.concatenated([phone, padding], axis: 1)
-            }
-        }
+        if phoneLen != minLen { phone = phone[0..., 0..<minLen, 0...] }
+        if f0Len != minLen { f0 = f0[0..., 0..<minLen, 0...] }
 
         if indexRate > 0, let indexManager = indexManager {
             phone = indexManager.search(features: phone, indexRate: indexRate)
@@ -507,7 +500,7 @@ public class RVCInference: ObservableObject {
         let pitchBuckets = pitch.asType(Int32.self)
         
         let nsff0 = f0HzClean.expandedDimensions(axis: 2)
-        let phoneLengths = MLXArray([Int32(targetLen)])
+        let phoneLengths = MLXArray([Int32(minLen)])
         let sid = MLXArray([Int32(0)])
 
         // 4. Synthesizer 推論実行

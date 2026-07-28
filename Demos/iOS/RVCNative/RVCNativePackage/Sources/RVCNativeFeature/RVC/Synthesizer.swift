@@ -197,12 +197,7 @@ class TextEncoder: Module {
         // なぜかここまでは (B, C, T) になってしまっていた可能性があるため
         // 🚨 明示的に (B, T, C) に確実に転置して返す
         
-        var stats = proj(x) * xMaskExpanded
-        if stats.shape[1] == outChannels * 2 {
-            // (B, C, T) 担ってしまっている場合 (B, T, C) に直す
-            stats = stats.transposed(0, 2, 1)
-        }
-
+        let stats = proj(x) * xMaskExpanded
         let splitIdx = outChannels
         let m = stats[0..., 0..., 0..<splitIdx]         // (B, T, C)
         let logs = stats[0..., 0..., splitIdx...]       // (B, T, C)
@@ -375,12 +370,12 @@ class ResidualCouplingBlock: Module {
         if !reverse {
             for i in 0..<nFlows {
                 h = flows[i](h, xMask: xMask, g: g, reverse: false)
-                h = h[0..., .stride(by: -1), 0...]
+                h = h[0..., 0..., .stride(by: -1)]
                 MLX.eval(h)
             }
         } else {
             for i in (0..<nFlows).reversed() {
-                h = h[0..., .stride(by: -1), 0...]
+                h = h[0..., 0..., .stride(by: -1)]
                 MLX.eval(h)
                 h = flows[i](h, xMask: xMask, g: g, reverse: true)
             }
