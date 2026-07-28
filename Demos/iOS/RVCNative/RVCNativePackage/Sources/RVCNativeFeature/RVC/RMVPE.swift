@@ -671,19 +671,21 @@ class RMVPE: Module {
         // Convert array to MLXArray
         var centsPred = MLXArray(centsPredArray)
 
-        // Apply threshold based on max salience
+        // Apply threshold based on relative peak contrast
         // h is post-sigmoid output [T, 360].
-        // Unvoiced/silent frames produce flat activations around 0.5 (sigmoid(0)).
-        // True voiced peaks reach >= 0.55.
+        // Silent frames produce uniform outputs (maxx ≈ minx ≈ 0.50).
+        // Voiced frames produce distinct pitch peaks (maxx - minx >= 0.05).
         let maxx = MLX.max(h, axis: 1)  // [T]
+        let minx = MLX.min(h, axis: 1)  // [T]
+        let contrast = maxx - minx      // [T]
         
-        // DEBUG: Check maxx values
-        let maxxMin = maxx.min().item(Float.self)
-        let maxxMax = maxx.max().item(Float.self)
-        let maxxMean = maxx.mean().item(Float.self)
-        print("DEBUG RMVPE: maxx stats: min=\(maxxMin), max=\(maxxMax), mean=\(maxxMean), thred=\(thred)")
+        let contrastMin = contrast.min().item(Float.self)
+        let contrastMax = contrast.max().item(Float.self)
+        let contrastMean = contrast.mean().item(Float.self)
+        print("DEBUG RMVPE: contrast stats: min=\(contrastMin), max=\(contrastMax), mean=\(contrastMean)")
         
-        let voicedMask = maxx .>= thred  // True where voiced (high salience)
+        // Thresholding based on peak contrast
+        let voicedMask = contrast .>= 0.05  // True where voiced (distinct peak)
         let numVoiced = MLX.sum(voicedMask.asType(Float.self)).item(Float.self)
         print("DEBUG RMVPE: voiced frames: \(numVoiced) / \(T) (\(100*numVoiced/Float(T))%)")
         

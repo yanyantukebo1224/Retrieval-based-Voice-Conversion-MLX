@@ -398,6 +398,15 @@ public class RVCInference: ObservableObject {
             }
             
             MLX.eval(finalOutput)
+            
+            // Peak normalization for clear audible volume
+            let maxAmp = MLX.abs(finalOutput).max().item(Float.self)
+            if maxAmp > 0.001 && maxAmp < 0.95 {
+                let targetAmp: Float = 0.85
+                finalOutput = finalOutput * (targetAmp / maxAmp)
+                MLX.eval(finalOutput)
+            }
+
             if volumeEnvelope != 1.0 {
                 finalOutput = finalOutput * volumeEnvelope
                 MLX.eval(finalOutput)
