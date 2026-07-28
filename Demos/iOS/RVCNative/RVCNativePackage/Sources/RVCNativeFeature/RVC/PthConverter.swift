@@ -335,13 +335,17 @@ public final class PthConverter: Sendable {
                 newKey = String(newKey.dropLast(5)) + ".bias"
             }
 
-            remappedDict[newKey] = v
-        }
+            var val = v
+            if val.ndim == 3 && newKey.hasSuffix(".weight") {
+                if newKey.contains("dec.up_") || newKey.contains("dec.ups.") {
+                    val = val.transposed(axes: [1, 2, 0])
+                } else {
+                    val = val.transposed(axes: [0, 2, 1])
+                }
+            }
 
-        // ⚠️【修正ポイント】
-        // 無差別な 3次元重みの転置処理（val.transposed）を削除し、
-        // PyTorchの元のデータ構造を壊さずに返形します。
-        // RVC / RMVPE / HuBERT の個別の転置処理は RVCInference.swift で行われます。
+            remappedDict[newKey] = val
+        }
         
         return remappedDict
     }
