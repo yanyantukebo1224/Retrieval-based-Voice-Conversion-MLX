@@ -228,14 +228,6 @@ public class RVCInference: ObservableObject {
                 }
             }
 
-            if newK.contains("enc_p.encoder.") {
-                for i in 0..<6 {
-                    newK = newK.replacingOccurrences(of: "encoder.attn_\(i).", with: "encoder.attn_layers.\(i).")
-                    newK = newK.replacingOccurrences(of: "encoder.norm1_\(i).", with: "encoder.norm_layers_1.\(i).")
-                    newK = newK.replacingOccurrences(of: "encoder.ffn_\(i).", with: "encoder.ffn_layers.\(i).")
-                    newK = newK.replacingOccurrences(of: "encoder.norm2_\(i).", with: "encoder.norm_layers_2.\(i).")
-                }
-            }
 
             if needsConvInsertion(newK) && !newK.contains(".conv.") {
                 if newK.hasSuffix(".weight") { newK = String(newK.dropLast(7)) + ".conv.weight" }

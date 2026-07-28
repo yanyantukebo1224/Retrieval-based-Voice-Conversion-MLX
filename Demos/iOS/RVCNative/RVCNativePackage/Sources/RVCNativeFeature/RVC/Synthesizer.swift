@@ -112,27 +112,43 @@ class FFN: Module {
 class RVCEncoder: Module {
     let nLayers: Int
     let drop: MLXNN.Dropout
-    var attn_layers: [MultiHeadAttention] = []
-    var norm_layers_1: [MLXNN.LayerNorm] = []
-    var ffn_layers: [FFN] = []
-    var norm_layers_2: [MLXNN.LayerNorm] = []
     
-    init(hiddenChannels: Int, filterChannels: Int, nHeads: Int, nLayers: Int, kernelSize: Int = 1, pDropout: Float = 0.0, windowSize: Int = 10) {
+    let attn_0, attn_1, attn_2, attn_3, attn_4, attn_5: MultiHeadAttention
+    let norm1_0, norm1_1, norm1_2, norm1_3, norm1_4, norm1_5: MLXNN.LayerNorm
+    let ffn_0, ffn_1, ffn_2, ffn_3, ffn_4, ffn_5: FFN
+    let norm2_0, norm2_1, norm2_2, norm2_3, norm2_4, norm2_5: MLXNN.LayerNorm
+    
+    init(hiddenChannels: Int, filterChannels: Int, nHeads: Int, nLayers: Int = 6, kernelSize: Int = 1, pDropout: Float = 0.0, windowSize: Int = 10) {
         self.nLayers = nLayers
         self.drop = MLXNN.Dropout(p: pDropout)
         
-        self.attn_layers = (0..<nLayers).map { _ in
-            MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
-        }
-        self.norm_layers_1 = (0..<nLayers).map { _ in
-            MLXNN.LayerNorm(dimensions: hiddenChannels)
-        }
-        self.ffn_layers = (0..<nLayers).map { _ in
-            FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
-        }
-        self.norm_layers_2 = (0..<nLayers).map { _ in
-            MLXNN.LayerNorm(dimensions: hiddenChannels)
-        }
+        self.attn_0 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        self.attn_1 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        self.attn_2 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        self.attn_3 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        self.attn_4 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        self.attn_5 = MultiHeadAttention(channels: hiddenChannels, outChannels: hiddenChannels, nHeads: nHeads, pDropout: pDropout, windowSize: windowSize)
+        
+        self.norm1_0 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm1_1 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm1_2 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm1_3 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm1_4 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm1_5 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        
+        self.ffn_0 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        self.ffn_1 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        self.ffn_2 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        self.ffn_3 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        self.ffn_4 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        self.ffn_5 = FFN(inChannels: hiddenChannels, outChannels: hiddenChannels, filterChannels: filterChannels, kernelSize: kernelSize, pDropout: pDropout)
+        
+        self.norm2_0 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm2_1 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm2_2 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm2_3 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm2_4 = MLXNN.LayerNorm(dimensions: hiddenChannels)
+        self.norm2_5 = MLXNN.LayerNorm(dimensions: hiddenChannels)
         
         super.init()
     }
@@ -143,12 +159,17 @@ class RVCEncoder: Module {
         
         var h = x * xMask
         
+        let attnLayers = [attn_0, attn_1, attn_2, attn_3, attn_4, attn_5]
+        let norm1Layers = [norm1_0, norm1_1, norm1_2, norm1_3, norm1_4, norm1_5]
+        let ffnLayers = [ffn_0, ffn_1, ffn_2, ffn_3, ffn_4, ffn_5]
+        let norm2Layers = [norm2_0, norm2_1, norm2_2, norm2_3, norm2_4, norm2_5]
+        
         for i in 0..<nLayers {
-            let y = attn_layers[i](h, c: h, attnMask: attnMask)
-            h = norm_layers_1[i](h + drop(y))
+            let y = attnLayers[i](h, c: h, attnMask: attnMask)
+            h = norm1Layers[i](h + drop(y))
             
-            let y2 = ffn_layers[i](h, xMask: xMask)
-            h = norm_layers_2[i](h + drop(y2))
+            let y2 = ffnLayers[i](h, xMask: xMask)
+            h = norm2Layers[i](h + drop(y2))
         }
         
         return h * xMask
