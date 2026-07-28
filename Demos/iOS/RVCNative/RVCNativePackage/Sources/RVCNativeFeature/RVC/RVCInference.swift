@@ -447,7 +447,7 @@ public class RVCInference: ObservableObject {
         // 2. RMVPE によるピッチ抽出
         var f0: MLXArray
         if let rmvpe = rmvpe {
-            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.15)
+            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.55)
         } else {
             let frames = hubertFeatures.shape[1] * 2
             f0 = MLX.zeros([1, frames, 1])

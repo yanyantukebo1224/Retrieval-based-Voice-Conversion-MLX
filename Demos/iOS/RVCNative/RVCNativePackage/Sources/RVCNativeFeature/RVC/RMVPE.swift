@@ -608,7 +608,7 @@ class RMVPE: Module {
         return x
     }
     
-    func decode(_ hidden: MLXArray, thred: Float = 0.03) -> MLXArray {
+    func decode(_ hidden: MLXArray, thred: Float = 0.55) -> MLXArray {
         /// Decodes hidden representation to F0.
         /// Matches Python MLX implementation exactly (rvc_mlx/lib/mlx/rmvpe.py:355-404)
         ///
@@ -672,9 +672,10 @@ class RMVPE: Module {
         var centsPred = MLXArray(centsPredArray)
 
         // Apply threshold based on max salience
-        // Python: cents_pred[maxx <= thred] = 0
-        // This zeros out cents_pred for unvoiced segments (low salience)
-        let maxx = MLX.max(salience, axis: 1)  // [T]
+        // h is post-sigmoid output [T, 360].
+        // Unvoiced/silent frames produce flat activations around 0.5 (sigmoid(0)).
+        // True voiced peaks reach >= 0.55.
+        let maxx = MLX.max(h, axis: 1)  // [T]
         
         // DEBUG: Check maxx values
         let maxxMin = maxx.min().item(Float.self)
@@ -682,7 +683,7 @@ class RMVPE: Module {
         let maxxMean = maxx.mean().item(Float.self)
         print("DEBUG RMVPE: maxx stats: min=\(maxxMin), max=\(maxxMax), mean=\(maxxMean), thred=\(thred)")
         
-        let voicedMask = maxx .> thred  // True where voiced (high salience)
+        let voicedMask = maxx .>= thred  // True where voiced (high salience)
         let numVoiced = MLX.sum(voicedMask.asType(Float.self)).item(Float.self)
         print("DEBUG RMVPE: voiced frames: \(numVoiced) / \(T) (\(100*numVoiced/Float(T))%)")
         
@@ -701,7 +702,7 @@ class RMVPE: Module {
     }
     
     // Helper to run full inference
-    func infer(audio: MLXArray, thred: Float = 0.03) -> MLXArray {
+    func infer(audio: MLXArray, thred: Float = 0.55) -> MLXArray {
         // audio: [T]
         let melProcessor = MelSpectrogram()
         melProcessor.debug_mel_filterbank()

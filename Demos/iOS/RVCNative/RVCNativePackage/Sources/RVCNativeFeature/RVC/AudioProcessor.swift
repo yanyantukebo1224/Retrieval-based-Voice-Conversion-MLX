@@ -109,7 +109,8 @@ final class AudioProcessor: @unchecked Sendable {
         
         // Restore declarations
         let targetBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetFrameCount)!
-        var hasProvidedData = false
+        final class AtomicBool: @unchecked Sendable { var value = false }
+        let hasProvidedData = AtomicBool()
         var error: NSError? = nil
         
         struct BufferWrapper: @unchecked Sendable {
@@ -119,11 +120,11 @@ final class AudioProcessor: @unchecked Sendable {
         
         // AVAudioConverterInputBlock
         let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
-            if hasProvidedData {
+            if hasProvidedData.value {
                 outStatus.pointee = .noDataNow
                 return nil
             }
-            hasProvidedData = true
+            hasProvidedData.value = true
             outStatus.pointee = .haveData
             return wrapper.buffer
         }
