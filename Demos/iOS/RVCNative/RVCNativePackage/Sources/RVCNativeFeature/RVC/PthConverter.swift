@@ -238,7 +238,7 @@ public final class PthConverter: Sendable {
         let keys = Array(dict.keys)
         var processedPrefixes = Set<String>()
         
-        // Weight Norm Fusion
+        // Weight Norm Fusion for ALL layers (conv_pre, conv_post, noise_convs, up, resblocks, etc.)
         for k in keys {
             if k.hasSuffix(".weight_g") {
                 let prefix = String(k.dropLast(9))
@@ -252,11 +252,13 @@ public final class PthConverter: Sendable {
                 var norm_v: MLXArray
                 if w_v.ndim == 3 {
                     norm_v = MLX.sqrt(MLX.sum(w_v * w_v, axes: [1, 2], keepDims: true))
+                } else if w_v.ndim == 4 {
+                    norm_v = MLX.sqrt(MLX.sum(w_v * w_v, axes: [1, 2, 3], keepDims: true))
                 } else {
                     norm_v = MLX.sqrt(MLX.sum(w_v * w_v, axes: [1], keepDims: true))
                 }
                 
-                let w = w_g * (w_v / norm_v)
+                let w = w_g * (w_v / (norm_v + 1e-12))
                 newDict[prefix + ".weight"] = w
                 processedPrefixes.insert(prefix)
                 

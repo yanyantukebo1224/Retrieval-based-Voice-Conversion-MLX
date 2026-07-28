@@ -245,46 +245,6 @@ public class RVCInference: ObservableObject {
             synthParams[newK] = newV
         }
 
-        for i in 0..<4 {
-            let gKey = "dec.up_\(i).weight_g"
-            let vKey = "dec.up_\(i).weight_v"
-            let outKey = "dec.up_\(i).weight"
-            
-            if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                let v_sqr = weight_v * weight_v
-                let v_sum = v_sqr.sum(axes: [0, 2], keepDims: true)
-                let v_norm = sqrt(v_sum + 1e-12)
-                let weight_normalized = weight_v / v_norm
-                let weight_fused = weight_g * weight_normalized
-                
-                synthParams[outKey] = weight_fused.transposed(axes: [1, 2, 0])
-                synthParams.removeValue(forKey: gKey)
-                synthParams.removeValue(forKey: vKey)
-            }
-        }
-        
-        for i in 0..<12 {
-            for (convPrefix, convCount) in [("c1_", 3), ("c2_", 3)] {
-                for j in 0..<convCount {
-                    let base = "dec.resblock_\(i).\(convPrefix)\(j)"
-                    let gKey = "\(base).weight_g"
-                    let vKey = "\(base).weight_v"
-                    let outKey = "\(base).conv.weight"
-                    
-                    if let weight_g = synthParams[gKey], let weight_v = synthParams[vKey] {
-                        let v_sqr = weight_v * weight_v
-                        let v_sum = v_sqr.sum(axes: [1, 2], keepDims: true)
-                        let v_norm = sqrt(v_sum + 1e-12)
-                        let weight_normalized = weight_v / v_norm
-                        let weight_fused = weight_g * weight_normalized
-                        
-                        synthParams[outKey] = weight_fused.transposed(axes: [0, 2, 1])
-                        synthParams.removeValue(forKey: gKey)
-                        synthParams.removeValue(forKey: vKey)
-                    }
-                }
-            }
-        }
 
         self.synthesizer?.update(parameters: ModuleParameters.unflattened(synthParams))
         self.synthesizer?.train(false)
