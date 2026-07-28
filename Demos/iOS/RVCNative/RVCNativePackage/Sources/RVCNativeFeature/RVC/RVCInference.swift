@@ -489,16 +489,18 @@ public class RVCInference: ObservableObject {
         
         let f0_min: Float = 50.0
         let f0_max: Float = 1100.0
-        let f0HzClean = MLX.where(f0Hz .<= f0_min, MLXArray(0.0), f0Hz)
+        let f0HzClean = MLX.where(f0Hz .<= f0_min, MLXArray(Float(0.0)), f0Hz)
         
-        let f0_mel_min = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
-        let f0_mel_max = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
-        let f0_mel = 1127.0 * MLX.log(1.0 + MLX.maximum(f0HzClean, f0_min) / 700.0)
+        let f0MelMin = 1127.0 * Darwin.log(1.0 + Double(f0_min) / 700.0)
+        let f0MelMax = 1127.0 * Darwin.log(1.0 + Double(f0_max) / 700.0)
+        let f0Mel = 1127.0 * MLX.log(1.0 + f0HzClean / 700.0)
         
-        var pitch = (f0_mel - f0_mel_min) * (254.0 / (f0_mel_max - f0_mel_min)) + 1.0
-        pitch = MLX.where(f0HzClean .== 0.0, MLXArray(1.0), pitch) 
-        pitch = MLX.clip(pitch, min: 1.0, max: 255.0)
-        let pitchBuckets = pitch.asType(Int32.self)
+        let pitchCoarse = MLX.where(
+            f0HzClean .> f0_min,
+            MLX.clip(MLX.floor((f0Mel - Float(f0MelMin)) * 254.0 / Float(f0MelMax - f0MelMin) + 1.0) + 1.0, min: 1.0, max: 255.0),
+            MLXArray(Float(1.0))
+        )
+        let pitchBuckets = pitchCoarse.asType(Int32.self)
         
         let nsff0 = f0HzClean.expandedDimensions(axis: 2)
         let phoneLengths = MLXArray([Int32(minLen)])
