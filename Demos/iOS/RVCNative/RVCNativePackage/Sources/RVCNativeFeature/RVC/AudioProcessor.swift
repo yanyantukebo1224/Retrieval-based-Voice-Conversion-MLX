@@ -47,11 +47,8 @@ final class AudioProcessor: @unchecked Sendable {
         }
         
         // Resample if necessary
-        if file.fileFormat.sampleRate != targetSampleRate {
-            // Simple linear interpolation or Accelerate vDSP for demo
-            // For robust resale, we should use vDSP_desamp or AVAudioConverter
-            // Using AVAudioConverter here for quality
-            audioSamples = try resample(buffer: buffer, from: file.fileFormat.sampleRate, to: targetSampleRate)
+        if format.sampleRate != targetSampleRate {
+            audioSamples = try resample(buffer: buffer, from: format.sampleRate, to: targetSampleRate)
         }
         
         // Create MLXArray
@@ -112,6 +109,7 @@ final class AudioProcessor: @unchecked Sendable {
         
         // Restore declarations
         let targetBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetFrameCount)!
+        var hasProvidedData = false
         var error: NSError? = nil
         
         struct BufferWrapper: @unchecked Sendable {
@@ -121,6 +119,11 @@ final class AudioProcessor: @unchecked Sendable {
         
         // AVAudioConverterInputBlock
         let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+            if hasProvidedData {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            hasProvidedData = true
             outStatus.pointee = .haveData
             return wrapper.buffer
         }
