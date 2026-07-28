@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Windows用 RVC 実効推論＆音声書き出しスクリプト (test_windows_infer.py)
 
 使い方:
