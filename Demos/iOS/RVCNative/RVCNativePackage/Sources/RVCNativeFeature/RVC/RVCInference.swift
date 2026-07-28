@@ -235,10 +235,16 @@ public class RVCInference: ObservableObject {
             }
 
             if newK.hasSuffix(".weight") && newV.ndim == 3 {
-                if newK.contains(".up_") || newK.contains(".ups.") {
-                    newV = newV.transposed(axes: [1, 2, 0])
-                } else {
-                    newV = newV.transposed(axes: [0, 2, 1])
+                // Prevent double transposition: PyTorch Conv1d is [Out, In, K], MLX is [Out, K, In].
+                // If K <= 32 and In > 32, it is ALREADY transposed to MLX format.
+                let s = newV.shape
+                let isAlreadyMLX = (s[1] <= 32 && s[2] > 32)
+                if !isAlreadyMLX {
+                    if newK.contains(".up_") || newK.contains(".ups.") {
+                        newV = newV.transposed(axes: [1, 2, 0])
+                    } else {
+                        newV = newV.transposed(axes: [0, 2, 1])
+                    }
                 }
             }
 
