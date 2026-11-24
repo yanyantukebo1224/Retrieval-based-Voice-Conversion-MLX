@@ -73,6 +73,14 @@ public class RVCInference: ObservableObject {
             return
         }
 
+        guard let rmvpeURL else {
+            throw NSError(
+                domain: "RVCInference",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "RMVPE pitch model is required for RVC conversion. Import rmvpe.safetensors (or rmvpe.pt/.pth) and retry. Without F0, RVC produces noise instead of a valid voiced conversion."]
+            )
+        }
+
         DispatchQueue.main.async { self.status = "Loading models..." }
         
         // 1. Load Hubert
@@ -314,8 +322,9 @@ public class RVCInference: ObservableObject {
                 self.rmvpe?.setTrainingMode(false)
                 log("RVCInference: ✅ RMVPE loaded")
             } catch {
-                log("RVCInference: Failed to load RMVPE: \(error)")
+                log("RVCInference: Failed to load required RMVPE: \(error)")
                 self.rmvpe = nil
+                throw error
             }
         }
 
@@ -420,14 +429,26 @@ public class RVCInference: ObservableObject {
         GPU.clearCache()
         
         // 2. RMVPE によるピッチ抽出
-        var f0: MLXArray
-        if let rmvpe = rmvpe {
-            f0 = rmvpe.infer(audio: cleanAudio, thred: 0.55)
-        } else {
-            let frames = hubertFeatures.shape[1] * 2
-            f0 = MLX.zeros([1, frames, 1])
+        guard let rmvpe = rmvpe else {
+            throw NSError(
+                domain: "RVCInference",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "RMVPE is not loaded. Conversion was stopped to prevent noise-only output."]
+            )
         }
+        var f0 = rmvpe.infer(audio: cleanAudio, thred: 0.55)
         MLX.eval(f0)
+
+        // A zero/invalid pitch curve is the same failure mode as missing RMVPE:
+        // the NSF generator receives only unvoiced excitation and can sound like noise.
+        let maxF0 = f0.max().item(Float.self)
+        guard maxF0.isFinite && maxF0 > 0 else {
+            throw NSError(
+                domain: "RVCInference",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "RMVPE returned an invalid or all-zero pitch curve. Check the RMVPE weights and use an input containing voiced speech."]
+            )
+        }
         GPU.clearCache()
         
         // 3. 特徴量のフレーム調整 (2倍展開)
